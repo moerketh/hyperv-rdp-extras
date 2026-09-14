@@ -35,12 +35,42 @@ use anyhow::{Context as _, Result};
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
-/// Output name KWin will assign/connect (`Virtual-<name>` in kscreen).
-pub const OUTPUT_NAME: &str = "lamco";
+/// Configuration for the virtual-output machinery: the name KWin will
+/// assign/connect (`Virtual-<name>` in kscreen) and the full kscreen
+/// connector name to exclude from physical-output management.
+///
+/// The exclusion used by the kscreen parser is EXACT-match against
+/// `kscreen_name` (see [`parse_enabled_physical_outputs`]): a DRM virtual
+/// connector (e.g. Hyper-V's `Virtual-1`) is itself a physical output that
+/// the layout guard must manage, so the match may never be a
+/// `"Virtual-"` prefix.
+#[derive(Debug, Clone)]
+pub struct VirtualOutputConfig {
+    /// The name passed to `stream_virtual_output`; KWin lists the output
+    /// as `Virtual-{name}` in kscreen.
+    pub name: String,
+    /// The full kscreen connector name to exclude from physical-output
+    /// management. Must equal `Virtual-{name}` for the exclusion to hit.
+    pub kscreen_name: String,
+}
 
-/// The full kscreen connector name of our virtual output
-/// (`Virtual-{OUTPUT_NAME}`).
-pub const VIRTUAL_OUTPUT_KSCREEN_NAME: &str = "Virtual-lamco";
+impl VirtualOutputConfig {
+    /// Build a config from the output name; derives the kscreen connector
+    /// name (`Virtual-{name}`) the way KWin does.
+    #[must_use]
+    pub fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            kscreen_name: format!("Virtual-{name}"),
+        }
+    }
+
+    /// The config the lamco fork historically used (`Virtual-lamco`).
+    #[must_use]
+    pub fn fork_default() -> Self {
+        Self::new("lamco")
+    }
+}
 
 /// How long to wait for a virtual-output stream's `created` reply before
 /// declaring the create wedged (KWin not answering) and giving up.
@@ -139,17 +169,26 @@ struct WlState {
 /// the active one.
 pub struct VirtualOutputManager {
     wl: RwLock<WlState>,
+    /// Output identity (name + kscreen exclusion), passed to the thread.
+    config: VirtualOutputConfig,
     /// Set when the Wayland thread has died (compositor gone); the next
     /// create will rebuild it.
     wl_dead: AtomicBool,
 }
 
 impl VirtualOutputManager {
-    /// A manager with no Wayland thread yet (it is created on demand).
+    /// A manager using the fork's historical output name (`lamco`).
     #[must_use]
     pub fn new() -> Self {
+        Self::with_config(VirtualOutputConfig::fork_default())
+    }
+
+    /// A manager for a custom virtual-output identity.
+    #[must_use]
+    pub fn with_config(config: VirtualOutputConfig) -> Self {
         Self {
             wl: RwLock::new(WlState { tx: None }),
+            config,
             wl_dead: AtomicBool::new(true),
         }
     }
@@ -160,9 +199,10 @@ impl VirtualOutputManager {
             let mut guard = self.wl.write().await;
             if guard.tx.is_none() {
                 let (tx, rx) = std::sync::mpsc::channel::<WlCommand>();
+                let config = self.config.clone();
                 std::thread::Builder::new()
                     .name("kwin-zkde-screencast".into())
-                    .spawn(move || wayland_thread(rx))
+                    .spawn(move || wayland_thread(rx, config))
                     .context("Failed to spawn zkde-screencast thread")?;
                 guard.tx = Some(tx);
                 self.wl_dead.store(false, Ordering::Release);
@@ -203,20 +243,21 @@ impl VirtualOutputManager {
             .map_err(|_| anyhow::anyhow!("zkde stream reply dropped"))?
             .map_err(|e| anyhow::anyhow!("zkde stream creation failed: {e}"))?;
 
+        let output_name = &self.config.name;
+        let kscreen_name = self.config.kscreen_name.clone();
         info!(
-            "[kwin-virtual] virtual output '{OUTPUT_NAME}' @ {width}x{height} streaming on node {node_id}"
+            "[kwin-virtual] virtual output '{output_name}' @ {width}x{height} streaming on node {node_id}"
         );
         // Enable is a best-effort blocking call on the kscreen tool; it is
         // idempotent and a failure only risks the black-screen signature.
-        let enabled =
-            tokio::task::spawn_blocking(move || enable_output(VIRTUAL_OUTPUT_KSCREEN_NAME))
-                .await
-                .unwrap_or(false);
+        let enabled = tokio::task::spawn_blocking(move || enable_output(&kscreen_name))
+            .await
+            .unwrap_or(false);
         if enabled {
-            info!("[kwin-virtual] virtual output '{OUTPUT_NAME}' enabled");
+            info!("[kwin-virtual] virtual output '{output_name}' enabled");
         } else {
             warn!(
-                "[kwin-virtual] virtual output '{OUTPUT_NAME}' could NOT be enabled — \
+                "[kwin-virtual] virtual output '{output_name}' could NOT be enabled — \
                  session may show a black screen"
             );
         }
@@ -242,7 +283,7 @@ impl Default for VirtualOutputManager {
 // Wayland thread
 // ============================================================================
 
-fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>) {
+fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>, config: VirtualOutputConfig) {
     use wayland_client::{Connection, Dispatch, QueueHandle, protocol::wl_registry};
 
     use wayland_protocols_plasma::screencast::v1::client::{
@@ -544,7 +585,7 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>) {
                     // is suppressed by a transparent pointer shape at the
                     // RDP layer instead.
                     let stream = screencast.stream_virtual_output(
-                        OUTPUT_NAME.to_string(),
+                        config.name.clone(),
                         width,
                         height,
                         // scale: 1.0 — clients express size in physical
@@ -635,9 +676,14 @@ impl OutputLayoutGuard {
     /// not allowed"), which bounces back silently. A disable that bounced
     /// is retried once after the compositor settles.
     pub async fn engage() -> Self {
-        let mut names = tokio::task::spawn_blocking(list_enabled_physical_outputs)
-            .await
-            .unwrap_or_default();
+        let config = VirtualOutputConfig::fork_default();
+        // The exclusion name is what the closures need; clone it per
+        // spawn_blocking so `config` itself is not moved.
+        let exclude0 = config.kscreen_name.clone();
+        let mut names =
+            tokio::task::spawn_blocking(move || list_enabled_physical_outputs(&exclude0))
+                .await
+                .unwrap_or_default();
         if names.is_empty() {
             info!("[kwin-virtual] no physical outputs to manage (already headless?)");
             return Self {
@@ -661,9 +707,11 @@ impl OutputLayoutGuard {
         // screen). If a disable still bounced, retry once after the
         // compositor settles.
         tokio::time::sleep(Duration::from_millis(300)).await;
-        let still_enabled = tokio::task::spawn_blocking(list_enabled_physical_outputs)
-            .await
-            .unwrap_or_default();
+        let exclude = config.kscreen_name.clone();
+        let still_enabled =
+            tokio::task::spawn_blocking(move || list_enabled_physical_outputs(&exclude))
+                .await
+                .unwrap_or_default();
         let bounced: Vec<String> = names
             .iter()
             .filter(|n| still_enabled.contains(n))
@@ -681,9 +729,11 @@ impl OutputLayoutGuard {
                     .unwrap_or(false);
             }
             tokio::time::sleep(Duration::from_millis(300)).await;
-            let final_enabled = tokio::task::spawn_blocking(list_enabled_physical_outputs)
-                .await
-                .unwrap_or_default();
+            let exclude = config.kscreen_name.clone();
+            let final_enabled =
+                tokio::task::spawn_blocking(move || list_enabled_physical_outputs(&exclude))
+                    .await
+                    .unwrap_or_default();
             let stuck: Vec<String> = names
                 .iter()
                 .filter(|n| final_enabled.contains(n))
@@ -731,14 +781,15 @@ impl Drop for OutputLayoutGuard {
 /// Parse `kscreen-doctor -o` output: names of ENABLED outputs that are not
 /// our virtual one. Best-effort — returns empty on any failure.
 ///
-/// NOTE on naming: the exclusion is EXACT (`Virtual-lamco` — the name KWin
-/// assigns our zkde-created output). It must NOT be a "Virtual-" prefix
-/// match: a DRM virtual connector (e.g. Hyper-V's) may itself be named
-/// `Virtual-1`, and that IS a physical output this guard must manage
-/// (disabling it is the whole point — panel relocation + origin
-/// placement). A prefix exclusion would skip the DRM output entirely and
-/// leave a two-screen layout that breaks pointer coordinate mapping.
-fn list_enabled_physical_outputs() -> Vec<String> {
+/// NOTE on naming: the exclusion is EXACT (`exclude_kscreen_name` — the
+/// full kscreen name of our zkde-created output, e.g.
+/// `Virtual-{name}`). It must NOT be a "Virtual-" prefix match: a DRM
+/// virtual connector (e.g. Hyper-V's) may itself be named `Virtual-1`,
+/// and that IS a physical output this guard must manage (disabling it is
+/// the whole point — panel relocation + origin placement). A prefix
+/// exclusion would skip the DRM output entirely and leave a two-screen
+/// layout that breaks pointer coordinate mapping.
+fn list_enabled_physical_outputs(exclude_kscreen_name: &str) -> Vec<String> {
     let out = match std::process::Command::new("kscreen-doctor")
         .arg("-o")
         .stdin(std::process::Stdio::null())
@@ -762,7 +813,7 @@ fn list_enabled_physical_outputs() -> Vec<String> {
         }
     };
 
-    let names = parse_enabled_physical_outputs(&out);
+    let names = parse_enabled_physical_outputs(&out, exclude_kscreen_name);
     if names.is_empty() {
         // Either genuinely headless, or kscreen reported nothing usable.
         // The first 400 chars make the difference diagnosable in the log.
@@ -774,8 +825,14 @@ fn list_enabled_physical_outputs() -> Vec<String> {
     names
 }
 
-/// Pure parser: given `kscreen-doctor -o` text, return enabled output names
-/// excluding our own virtual output ([`VIRTUAL_OUTPUT_KSCREEN_NAME`]).
+/// Pure parser: given `kscreen-doctor -o` text, return enabled output
+/// names excluding `exclude_kscreen_name` (our own virtual output's full
+/// kscreen connector name).
+///
+/// The exclusion is EXACT-match (see [`VirtualOutputConfig`]): a DRM
+/// virtual connector (e.g. Hyper-V's `Virtual-1`) is itself a physical
+/// output the layout guard must manage, so the match may never be a
+/// `"Virtual-"` prefix.
 ///
 /// The text form is a sequence of blocks:
 ///
@@ -790,7 +847,10 @@ fn list_enabled_physical_outputs() -> Vec<String> {
 /// Blocks open with an "Output: N \<name\>" line; a bare "enabled" line
 /// marks the block's output enabled. Only enabled, non-virtual names are
 /// collected, in order.
-pub fn parse_enabled_physical_outputs(kscreen_text: &str) -> Vec<String> {
+pub fn parse_enabled_physical_outputs(
+    kscreen_text: &str,
+    exclude_kscreen_name: &str,
+) -> Vec<String> {
     // kscreen-doctor colorizes its output unconditionally (even piped), so
     // ANSI escape sequences sit between the marker words and the values
     // (e.g. "\u{1b}[01;32mOutput: \u{1b}[0;0m1 Virtual-1"). Strip them
@@ -805,7 +865,7 @@ pub fn parse_enabled_physical_outputs(kscreen_text: &str) -> Vec<String> {
         if let Some(rest) = line.strip_prefix("Output: ") {
             // Flush previous block.
             if let (Some(name), true) = (&current_name, current_enabled)
-                && name != VIRTUAL_OUTPUT_KSCREEN_NAME
+                && name != exclude_kscreen_name
             {
                 result.push(name.clone());
             }
@@ -818,7 +878,7 @@ pub fn parse_enabled_physical_outputs(kscreen_text: &str) -> Vec<String> {
     }
     // Flush the final block (no trailing "Output:" line).
     if let (Some(name), true) = (&current_name, current_enabled)
-        && name != VIRTUAL_OUTPUT_KSCREEN_NAME
+        && name != exclude_kscreen_name
     {
         result.push(name.clone());
     }
@@ -960,7 +1020,7 @@ Output: 3 DP-1
     enabled
 ";
         assert_eq!(
-            parse_enabled_physical_outputs(text),
+            parse_enabled_physical_outputs(text, "Virtual-lamco"),
             vec!["Virtual-1".to_string(), "DP-1".to_string()]
         );
     }
@@ -976,9 +1036,30 @@ Output: 2 Virtual-1
         // Exact-name exclusion: our virtual output is skipped, but the
         // DRM-named Virtual-1 (a real physical output here) is kept.
         assert_eq!(
-            parse_enabled_physical_outputs(text),
+            parse_enabled_physical_outputs(text, "Virtual-lamco"),
             vec!["Virtual-1".to_string()]
         );
+    }
+
+    #[test]
+    fn exclusion_name_is_parameterized() {
+        // A custom output identity: the exclusion follows the configured
+        // kscreen name, and a foreign Virtual-* output is treated as
+        // physical (it is not ours).
+        let text = "\
+Output: 1 Virtual-mine
+    enabled
+Output: 2 Virtual-lamco
+    enabled
+";
+        assert_eq!(
+            parse_enabled_physical_outputs(text, "Virtual-mine"),
+            vec!["Virtual-lamco".to_string()]
+        );
+        // The config derives the kscreen name from the output name.
+        let cfg = VirtualOutputConfig::new("mine");
+        assert_eq!(cfg.name, "mine");
+        assert_eq!(cfg.kscreen_name, "Virtual-mine");
     }
 
     #[test]
@@ -987,7 +1068,7 @@ Output: 2 Virtual-1
         let text =
             "\u{1b}[01;32mOutput: \u{1b}[0;0m1 HDMI-A-1\n    \u{1b}[01;32menabled\u{1b}[0m\n";
         assert_eq!(
-            parse_enabled_physical_outputs(text),
+            parse_enabled_physical_outputs(text, "Virtual-lamco"),
             vec!["HDMI-A-1".to_string()]
         );
     }
@@ -996,14 +1077,14 @@ Output: 2 Virtual-1
     fn final_block_without_trailing_marker_is_flushed() {
         let text = "Output: 1 eDP-1\n    enabled\n";
         assert_eq!(
-            parse_enabled_physical_outputs(text),
+            parse_enabled_physical_outputs(text, "Virtual-lamco"),
             vec!["eDP-1".to_string()]
         );
     }
 
     #[test]
     fn empty_text_yields_no_outputs() {
-        assert!(parse_enabled_physical_outputs("").is_empty());
+        assert!(parse_enabled_physical_outputs("", "Virtual-lamco").is_empty());
     }
 
     #[test]
