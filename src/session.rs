@@ -64,11 +64,13 @@ impl VirtualOutputConfig {
             kscreen_name: format!("Virtual-{name}"),
         }
     }
+}
 
-    /// The config the lamco fork historically used (`Virtual-lamco`).
-    #[must_use]
-    pub fn fork_default() -> Self {
-        Self::new("lamco")
+impl Default for VirtualOutputConfig {
+    /// The neutral default identity (`Virtual-rdp`). The fork passes its
+    /// own name (`lamco`) explicitly — see that repo's strategy shell.
+    fn default() -> Self {
+        Self::new("rdp")
     }
 }
 
@@ -177,10 +179,11 @@ pub struct VirtualOutputManager {
 }
 
 impl VirtualOutputManager {
-    /// A manager using the fork's historical output name (`lamco`).
+    /// A manager using the neutral default output identity (`rdp` →
+    /// `Virtual-rdp` in kscreen).
     #[must_use]
     pub fn new() -> Self {
-        Self::with_config(VirtualOutputConfig::fork_default())
+        Self::with_config(VirtualOutputConfig::default())
     }
 
     /// A manager for a custom virtual-output identity.
@@ -222,10 +225,11 @@ impl VirtualOutputManager {
     ///
     /// Ensures the fresh output is ENABLED — after EVERY create, not just
     /// the first (a resize recreate can be born disabled exactly like the
-    /// initial one; a persisted `kscreen-doctor output.Virtual-lamco.disable`
-    /// makes every later output be born disabled). A disabled output never
-    /// gets rendered into: the screencast buffers stay untouched (all-zero,
-    /// alpha 0x00) — the black-screen signature. Enable is idempotent.
+    /// initial one; a persisted `kscreen-doctor` disable of our virtual
+    /// output makes every later output be born disabled). A disabled
+    /// output never gets rendered into: the screencast buffers stay
+    /// untouched (all-zero, alpha 0x00) — the black-screen signature.
+    /// Enable is idempotent.
     pub async fn recreate_stream(&self, width: u16, height: u16) -> Result<u32> {
         let tx = self.ensure_wl_thread().await?;
 
@@ -668,7 +672,8 @@ pub struct OutputLayoutGuard {
 }
 
 impl OutputLayoutGuard {
-    /// Snapshot enabled non-virtual outputs, then disable them.
+    /// Snapshot enabled non-virtual outputs, then disable them, using the
+    /// neutral default output identity.
     ///
     /// Callers must have created the virtual output FIRST so a disable
     /// leaves a valid layout: KWin refuses to disable the ONLY enabled
@@ -676,7 +681,14 @@ impl OutputLayoutGuard {
     /// not allowed"), which bounces back silently. A disable that bounced
     /// is retried once after the compositor settles.
     pub async fn engage() -> Self {
-        let config = VirtualOutputConfig::fork_default();
+        Self::engage_with(VirtualOutputConfig::default()).await
+    }
+
+    /// [`engage`](Self::engage) with an explicit virtual-output identity:
+    /// the guard's kscreen exclusion matches the caller's config (the
+    /// manager must be creating outputs under the SAME identity, or the
+    /// guard would manage its own output as a physical one).
+    pub async fn engage_with(config: VirtualOutputConfig) -> Self {
         // The exclusion name is what the closures need; clone it per
         // spawn_blocking so `config` itself is not moved.
         let exclude0 = config.kscreen_name.clone();
@@ -1060,6 +1072,11 @@ Output: 2 Virtual-lamco
         let cfg = VirtualOutputConfig::new("mine");
         assert_eq!(cfg.name, "mine");
         assert_eq!(cfg.kscreen_name, "Virtual-mine");
+        // The neutral default is rdp → Virtual-rdp (the fork passes its
+        // own name explicitly; the default must stay identity-free).
+        let dflt = VirtualOutputConfig::default();
+        assert_eq!(dflt.name, "rdp");
+        assert_eq!(dflt.kscreen_name, "Virtual-rdp");
     }
 
     #[test]
