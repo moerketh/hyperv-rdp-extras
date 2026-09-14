@@ -1,0 +1,41 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: fmt + clippy + test (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all --check
+
+      - name: Clippy (all features, deny warnings)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Tests (all features)
+        run: cargo test --all-features
+
+      - name: Tests (no default features, geometry only)
+        run: cargo test --no-default-features --features geometry
+
+      - name: Tests (no features — compiles empty)
+        run: cargo build --no-default-features

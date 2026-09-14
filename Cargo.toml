@@ -1,0 +1,29 @@
+[package]
+name = "hyperv-rdp-extras"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT"
+description = "Standalone modules from the moerketh lamco-rdp-server Hyper-V fork: transport handshake deadline, damage-region geometry, and KWin virtual-output session machinery."
+repository = "https://github.com/moerketh/hyperv-rdp-extras"
+keywords = ["rdp", "hyper-v", "wayland", "damage-tracking", "async"]
+categories = ["multimedia::video", "network-programming", "os::linux-apis"]
+
+[dependencies]
+tokio = { version = "1.35", features = ["time", "io-util", "rt", "macros", "sync"], optional = true }
+tracing = { version = "0.1", optional = true }
+
+[features]
+default = ["geometry", "transport"]
+# Damage-region arithmetic: Region type, subtract_regions, macroblock snapping.
+# Pure std — no dependencies.
+geometry = []
+# AsyncRdpStream-agnostic first-byte deadline wrapper around any tokio stream.
+transport = ["dep:tokio", "dep:tracing"]
+
+[dev-dependencies]
+# Tests use tokio's paused-clock facilities and duplex streams.
+tokio = { version = "1.35", features = ["time", "io-util", "rt", "macros", "sync", "test-util"] }
+
+[package.metadata.docs.rs]
+all-features = true
