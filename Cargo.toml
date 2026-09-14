@@ -13,6 +13,12 @@ categories = ["multimedia::video", "network-programming", "os::linux-apis"]
 tokio = { version = "1.35", features = ["time", "io-util", "rt", "macros", "sync"], optional = true }
 tracing = { version = "0.1", optional = true }
 
+# kwin-virtual session module: zkde-screencast virtual output machinery.
+anyhow = { version = "1", optional = true }
+wayland-client = { version = "0.31", optional = true }
+wayland-protocols-plasma = { version = "0.3", features = ["client"], optional = true }
+nix = { version = "0.31", features = ["poll"], optional = true }
+
 [features]
 default = ["geometry", "transport"]
 # Damage-region arithmetic: Region type, subtract_regions, macroblock snapping.
@@ -20,6 +26,10 @@ default = ["geometry", "transport"]
 geometry = []
 # AsyncRdpStream-agnostic first-byte deadline wrapper around any tokio stream.
 transport = ["dep:tokio", "dep:tracing"]
+# Spec-derived transparent pointer-shape PDU fields (MS-RDPBCGR).
+cursor = ["dep:tracing"]
+# KWin zkde-screencast virtual-output machinery (KDE Plasma 6+).
+kwin-virtual = ["dep:tokio", "dep:tracing", "dep:anyhow", "dep:wayland-client", "dep:wayland-protocols-plasma", "dep:nix"]
 
 [dev-dependencies]
 # Tests use tokio's paused-clock facilities and duplex streams.

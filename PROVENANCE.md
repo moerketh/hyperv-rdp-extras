@@ -40,6 +40,26 @@ generic `S: AsyncRead + AsyncWrite + Unpin` instead of the fork's
 | Deliberately excluded | The macroblock-snap logic (`damage_regions_to_avc420` in fork `src/server/egfx_sender.rs`): upstream now contains its own expression of macroblock snapping (verified during extraction), so this is not fork-only and stays out of the crate |
 | Dependencies | std only |
 
+## `src/cursor.rs` — transparent pointer-shape fields + re-send counter
+
+| | |
+|---|---|
+| Fork source | The transparent-shape construction block in fork `src/server/display_handler.rs` (~:4606, Painted branch of `process_cursor_update`) + `PaintedShapeCounter` (:117-135) — fork-authored (measured on vmconnect , xrdp-parity approach) |
+| Purpose | Pointer ownership on clients that ignore `HidePointer`/SYSPTR_NULL: an all-opaque AND + all-zero XOR color-pointer shape makes the client render nothing |
+| Upstream-absence searches | `TS_COLORPOINTERATTRIBUTE` (0 hits in upstream code; their CHANGELOG documents a *different* cursor direction — server-driven shapes from metadata, not transparent-shape suppression), `PAINTED_SHAPE_INTERVAL`, `PaintedShapeCounter`, `painted_shape_counter` (0 hits) — performed during extraction |
+| Re-typing | RE-AUTHORED from the MS-RDPBCGR spec (TS_COLORPOINTERATTRIBUTE §2.2.9.1.1.4): the crate module describes the PDU field-by-field and constructs the masks itself; it does not inline the fork's `ColorPointer` construction — the fork adapts the fields into its protocol crate's type at its call site. The wire-format constants (24-bpp XOR, bit-per-pixel AND, 2-byte row padding notes) come from the spec, not from any repository's expression |
+| Dependencies | std + tracing — no protocol crates |
+
+## `src/session.rs` — KWin zkde-screencast virtual-output machinery
+
+| | |
+|---|---|
+| Fork source | `src/session/strategies/kwin_virtual.rs` (whole file, fork-authored: strategy added in the fork's 1.4.4-hyperv.1 lineage; the Wayland thread, create-before-close state machine, OutputLayoutGuard, kscreen parsers and the field-measured comments are fork work) |
+| Purpose | Create a KWin virtual output at an arbitrary resolution via the private zkde protocol and stream it (dialog-free, elastic resize); manage the physical-output layout around the session |
+| Upstream-absence searches | `zkde-screencast` (0 hits), `stream_virtual_output` (0 hits), `KwinVirtualStrategy` / `kwin-virtual` (0 hits), `OutputLayoutGuard` (0 hits), `parse_enabled_physical_outputs` (0 hits) — performed during extraction |
+| Re-typing | REWRITE per plan (Claude review pt 4): the fork file implements upstream's `SessionHandle` and composes `LibeiStrategy` (upstream machinery) — those stay fork-side. The crate module owns the genuinely self-contained machinery: the Wayland thread (registry bind, poll loop, create-before-close swap with `retiring`/`pending` lifecycle), `StreamRequestMachine` (re-expressed over a crate-local `StreamOutcome` enum instead of protocol event types, making it unit-testable off-compositor), `VirtualOutputManager` (thread owner minus the fork's StreamInfo/libei coupling), `OutputLayoutGuard` + kscreen parsers/helpers (verbatim-logic port of fork-authored code). The fork's strategy shell (libei composition, `SessionHandle` impl, `clipboard_source`/`build_clipboard`) remains in the fork and calls into this module |
+| Dependencies | wayland-client + wayland-protocols-plasma + nix(poll) + tokio + tracing + anyhow |
+
 ---
 
 ## Modules deliberately NOT extracted (non-exhaustive, for future maintainers)
