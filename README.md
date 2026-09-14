@@ -25,6 +25,30 @@ See [PROVENANCE.md](PROVENANCE.md) for the per-module audit trail.
   serial accept loop and blacking out every listener. Transport-agnostic:
   TCP, AF_VSOCK, Unix, TLS, WebSocket.
 
+### `cursor` — transparent pointer shape (opt-in)
+
+- [`TransparentPointer`](src/cursor.rs) — the MS-RDPBCGR
+  TS_COLORPOINTERATTRIBUTE fields of a fully transparent color-pointer
+  shape (all-opaque AND mask, all-zero 24-bpp XOR mask), for taking
+  pointer ownership on clients that ignore `HidePointer` (e.g. Hyper-V
+  vmconnect); plus [`ResendCounter`](src/cursor.rs) for the
+  immediate-first-send / periodic re-send cadence.
+
+### `session` — KWin virtual output (opt-in)
+
+- [`VirtualOutputManager`](src/session.rs) — creates a KWin virtual
+  output at an arbitrary resolution via the private zkde-screencast
+  protocol and streams it (dialog-free, elastic resize), with a
+  create-before-close stream lifecycle that never empties the enabled-
+  output set mid-swap
+- [`OutputLayoutGuard`](src/session.rs) — disables the physical (DRM)
+  outputs for the session so the virtual output becomes primary, and
+  re-enables them on drop, physical first
+- The virtual-output identity is **configurable**
+  ([`VirtualOutputConfig`](src/session.rs)): the crate's default is the
+  neutral `rdp` (kscreen `Virtual-rdp`); callers with their own output
+  name pass it explicitly (`with_config` / `engage_with`)
+
 ## Usage
 
 ```toml
@@ -32,8 +56,10 @@ See [PROVENANCE.md](PROVENANCE.md) for the per-module audit trail.
 hyperv-rdp-extras = { git = "https://github.com/moerketh/hyperv-rdp-extras", rev = "<pinned>" }
 ```
 
-Both modules are on by default; `default-features = false` +
-`features = ["geometry"]` drops the tokio dependency entirely.
+`geometry` and `transport` are on by default; `cursor` and `kwin-virtual`
+are opt-in (`features = ["cursor", "kwin-virtual"]`). With
+`default-features = false` + `features = ["geometry"]` the crate has no
+dependencies beyond `std`.
 
 ## License
 
