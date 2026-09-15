@@ -882,7 +882,16 @@ pub fn parse_enabled_physical_outputs(
                 result.push(name.clone());
             }
             // "1 Virtual-1" -> name is everything after the index.
-            current_name = rest.split_once(' ').map(|(_, n)| n.to_string());
+            //
+            // KWin >= 6.7 appends the output's UUID ("1 Virtual-1 <uuid>"),
+            // so the connector name is only the FIRST token after the index
+            // — anything after it is metadata, never part of the name. Older
+            // KWin (< 6.7) has no further tokens, so the token-split
+            // degenerates to the same value.
+            current_name = rest
+                .split_once(' ')
+                .and_then(|(_, n)| n.split(' ').next())
+                .map(str::to_string);
             current_enabled = false;
         } else if line == "enabled" {
             current_enabled = true;
