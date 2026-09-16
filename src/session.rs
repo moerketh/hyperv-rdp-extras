@@ -669,6 +669,9 @@ fn outcome_to_reply(outcome: StreamOutcome) -> Result<u32, String> {
 pub struct OutputLayoutGuard {
     /// Connector names that were disabled by this guard.
     disabled: Vec<String>,
+    /// The virtual output's kscreen name (exclusion for verification in
+    /// Drop — the same name the guard engaged with).
+    exclude: String,
 }
 
 impl OutputLayoutGuard {
@@ -700,6 +703,7 @@ impl OutputLayoutGuard {
             info!("[kwin-virtual] no physical outputs to manage (already headless?)");
             return Self {
                 disabled: Vec::new(),
+                exclude: config.kscreen_name.clone(),
             };
         }
         // SETTLE BEFORE DISABLING. The virtual output was created and
@@ -777,7 +781,10 @@ impl OutputLayoutGuard {
             // Only bookkeep the ones that actually disabled.
             names.retain(|n| !final_enabled.contains(n));
         }
-        Self { disabled: names }
+        Self {
+            disabled: names,
+            exclude: config.kscreen_name,
+        }
     }
 
     /// The connector names this guard disabled (for diagnostics).
@@ -791,14 +798,66 @@ impl Drop for OutputLayoutGuard {
         // Physical FIRST — the machine must never be left without a
         // display if the virtual output died first.
         let names = std::mem::take(&mut self.disabled);
-        for name in &names {
-            let n = name.clone();
-            let _ = std::thread::spawn(move || {
-                enable_output(&n);
-            })
-            .join();
+        let exclude = std::mem::take(&mut self.exclude);
+        if names.is_empty() {
+            return;
         }
-        if !names.is_empty() {
+        // Enable, VERIFY, retry — mirrors engage. A bounced enable here is
+        // not cosmetic: it leaves the machine headless and plasmashell
+        // falls to its placeholder screen, NEVER re-latching onto later
+        // outputs (field-observed 2026-09-16: a re-enable that raced KWin's
+        // teardown of the just-destroyed virtual output bounced silently;
+        // the machine stayed headless and every subsequent session was a
+        // black screen with frames flowing). The old code also logged
+        // "re-enabled" unconditionally while ignoring enable_output's
+        // return value.
+        for name in &names {
+            enable_output(name);
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        let still_disabled: Vec<String> = {
+            let ex = exclude.clone();
+            let enabled_now = list_enabled_physical_outputs(&ex);
+            names
+                .iter()
+                .filter(|n| !enabled_now.contains(n))
+                .cloned()
+                .collect()
+        };
+        if !still_disabled.is_empty() {
+            warn!(
+                "[kwin-virtual] re-enable bounced for [{}] — retrying once after settle",
+                still_disabled.join(", ")
+            );
+            for name in &still_disabled {
+                enable_output(name);
+            }
+            std::thread::sleep(Duration::from_millis(300));
+            let ex = exclude.clone();
+            let enabled_final = list_enabled_physical_outputs(&ex);
+            let stuck: Vec<String> = names
+                .iter()
+                .filter(|n| !enabled_final.contains(n))
+                .cloned()
+                .collect();
+            if !stuck.is_empty() {
+                error!(
+                    "[kwin-virtual] physical output(s) STILL disabled after retry: [{}] — the machine may be headless and plasmashell may be stuck on its placeholder screen",
+                    stuck.join(", ")
+                );
+            }
+            let restored: Vec<String> = names
+                .iter()
+                .filter(|n| enabled_final.contains(n))
+                .cloned()
+                .collect();
+            if !restored.is_empty() {
+                info!(
+                    "[kwin-virtual] physical output(s) re-enabled: [{}]",
+                    restored.join(", ")
+                );
+            }
+        } else {
             info!(
                 "[kwin-virtual] physical output(s) re-enabled: [{}]",
                 names.join(", ")
