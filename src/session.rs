@@ -702,6 +702,23 @@ impl OutputLayoutGuard {
                 disabled: Vec::new(),
             };
         }
+        // SETTLE BEFORE DISABLING. The virtual output was created and
+        // enabled moments ago; KWin announces it to Wayland clients via a
+        // wl_registry global event, but clients bind the new output
+        // ASYNCHRONOUSLY. Plasmashell processes pending registry events in
+        // its event loop — if the physical output's removal (our kscreen
+        // disable, which lands as an immediate wl_output global removal)
+        // reaches plasmashell's queue BEFORE it has bound the new virtual
+        // output, Qt sees zero outputs and falls to its placeholder screen
+        // ("qt.qpa.wayland: There are no outputs - creating placeholder
+        // screen") — and once in placeholder mode plasmashell NEVER
+        // re-latches onto the later-appearing output (field-observed
+        // 2026-09-04, mechanism confirmed 2026-09-16: the desktop keeps
+        // rendering into the placeholder while the virtual output scans
+        // out an empty desktop — frames flow, zero damage, black client).
+        // A settle window here lets plasmashell bind the virtual output
+        // first, so the subsequent disable is a plain output change.
+        tokio::time::sleep(Duration::from_millis(750)).await;
         info!(
             "[kwin-virtual] disabling physical output(s) for session: [{}]",
             names.join(", ")
