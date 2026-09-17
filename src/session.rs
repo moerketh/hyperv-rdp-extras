@@ -78,6 +78,13 @@ impl Default for VirtualOutputConfig {
 /// declaring the create wedged (KWin not answering) and giving up.
 pub const STREAM_CREATE_TIMEOUT: Duration = Duration::from_secs(10);
 
+    /// Settle window before a swapped-out stream's close is sent. The
+    /// close removes the old virtual output; plasmashell binds the
+    /// replacement's wl_registry global asynchronously, and a removal
+    /// processed before that bind sends Qt to its placeholder screen
+    /// (never re-latches; field-observed during resize churn). Mirrors the
+    /// layout guard's engage settle window.
+    pub const SETTLE_CLOSE_MS: Duration = Duration::from_millis(750);
 /// Commands sent to the Wayland connection thread.
 enum WlCommand {
     /// Create a virtual output at the given size; replies with the PipeWire
@@ -316,6 +323,19 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>, config: VirtualOutpu
         /// The PREVIOUS stream's proxy, kept alive while its replacement
         /// is being created (create-before-close).
         retiring: Option<ZkdeScreencastStreamUnstableV1>,
+        /// A retiring proxy parked for deferred close: (proxy, deadline).
+        /// The close is what removes the old virtual output; doing it the
+        /// instant the replacement's `created` event arrives still races
+        /// plasmashell's ASYNC bind of the new output's wl_registry global
+        /// — if the removal is processed first, Qt sees zero outputs,
+        /// creates its placeholder screen, and never re-latches (uniform
+        /// capture; field-observed during resize churn). Parking the close
+        /// for SETTLE_CLOSE_MS lets clients bind first, exactly like the
+        /// layout guard's engage settle.
+        closing: Option<(
+            ZkdeScreencastStreamUnstableV1,
+            std::time::Instant,
+        )>,
         /// Stream request state machine (conclusive-event bookkeeping).
         stream_sm: StreamRequestMachine,
     }
@@ -397,18 +417,21 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>, config: VirtualOutpu
                 }
                 match outcome {
                     StreamOutcome::Created { .. } => {
-                        // Replacement is live: destroy the previous stream
-                        // NOW — this close removes the old virtual output,
-                        // and it happens only AFTER the new one exists, so
-                        // the enabled-output set never empties mid-session
-                        // (a zero-outputs window sends plasmashell to its
-                        // placeholder screen — field-observed to never
-                        // re-latch: black screen). The main loop flushes
-                        // before its next poll, which delivers the close
-                        // promptly enough for a removal.
+                        // Replacement is live. Destroying the previous stream
+                        // NOW would remove the old virtual output before
+                        // plasmashell has (asynchronously) bound the new
+                        // one's registry global — a zero-outputs window that
+                        // sends Qt to its placeholder screen, which then
+                        // never re-latches (field-observed as a uniform
+                        // capture after resize churn). Park the close for
+                        // SETTLE_CLOSE_MS instead; the poll loop completes
+                        // it once the settle deadline passes.
                         if let Some(old) = state.retiring.take() {
-                            old.close();
-                            info!("[kwin-virtual] previous stream destroyed after swap");
+                            state.closing =
+                                Some((old, std::time::Instant::now() + SETTLE_CLOSE_MS));
+                            info!(
+                                "[kwin-virtual] swap complete — previous stream close parked for settle"
+                            );
                         }
                     }
                     StreamOutcome::Failed { .. } | StreamOutcome::Closed => {
@@ -475,6 +498,7 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>, config: VirtualOutpu
         screencast: None,
         pending: None,
         retiring: None,
+        closing: None,
         stream_sm: StreamRequestMachine::new(),
     };
 
@@ -609,7 +633,9 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>, config: VirtualOutpu
                     // what makes KWin remove the virtual output (the proxy
                     // was retained past the concluded request for exactly
                     // this call). A mid-swap retirement goes too: release
-                    // means NO virtual output may survive.
+                    // means NO virtual output may survive — including one
+                    // still parked for settle (its deadline is void once
+                    // the session releases).
                     let mut destroyed = false;
                     if let Some((stream, _)) = state.pending.take() {
                         stream.close();
@@ -617,6 +643,10 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>, config: VirtualOutpu
                     }
                     if let Some(old) = state.retiring.take() {
                         old.close();
+                        destroyed = true;
+                    }
+                    if let Some((parked, _)) = state.closing.take() {
+                        parked.close();
                         destroyed = true;
                     }
                     if destroyed {
@@ -634,6 +664,16 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>, config: VirtualOutpu
                     return;
                 }
             }
+        }
+
+        // Complete any settle-parked close: the replacement output has
+        // had SETTLE_CLOSE_MS to be bound by clients; removing the old one
+        // is now a plain output change instead of a zero-outputs window.
+        if let Some((parked, deadline)) = state.closing.take()
+            && std::time::Instant::now() >= deadline
+        {
+            parked.close();
+            info!("[kwin-virtual] settled — previous stream destroyed after swap");
         }
 
         // Always flush before the next poll iteration so requests reach
