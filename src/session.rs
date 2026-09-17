@@ -735,14 +735,41 @@ impl OutputLayoutGuard {
         // The exclusion name is what the closures need; clone it per
         // spawn_blocking so `config` itself is not moved.
         let exclude0 = config.kscreen_name.clone();
+        let exclude1 = config.kscreen_name.clone();
         let mut names =
             tokio::task::spawn_blocking(move || list_enabled_physical_outputs(&exclude0))
                 .await
                 .unwrap_or_default();
         if names.is_empty() {
-            info!("[kwin-virtual] no physical outputs to manage (already headless?)");
+            // Already headless (or kscreen unusable). Adopt the
+            // connected-but-DISABLED physical outputs anyway: Drop must
+            // re-enable the console at release even when the guard engaged
+            // a machine that was already blind. Without this, engage
+            // snapshotted nothing, Drop restored nothing, and a single
+            // headless entry wedged forever (field-observed: every later
+            // session streamed a dead shell after its teardown).
+            let adopted = tokio::task::spawn_blocking(move || {
+                list_recoverable_physical_outputs(&exclude1)
+            })
+            .await
+            .unwrap_or_default();
+            if adopted.is_empty() {
+                warn!(
+                    "[kwin-virtual] no enabled or recoverable physical outputs — console restore at release will be impossible"
+                );
+                return Self {
+                    disabled: Vec::new(),
+                    exclude: config.kscreen_name.clone(),
+                };
+            }
+            warn!(
+                "[kwin-virtual] layout already headless — adopting {} connected-but-disabled physical output(s) for restore at release",
+                adopted.len()
+            );
+            // They are ALREADY disabled: nothing to disable now, but Drop's
+            // re-enable must cover them.
             return Self {
-                disabled: Vec::new(),
+                disabled: adopted,
                 exclude: config.kscreen_name.clone(),
             };
         }
@@ -831,6 +858,31 @@ impl OutputLayoutGuard {
     pub fn disabled_outputs(&self) -> &[String] {
         &self.disabled
     }
+
+    /// Restore the physical outputs NOW and settle — the caller-facing
+    /// counterpart of Drop for the release path.
+    ///
+    /// [`release_after_client`](super) must call this BEFORE closing the
+    /// zkde stream: the close destroys the virtual output, and KWin-side
+    /// the physical outputs must not only be re-enabled but BOUND again by
+    /// clients before that removal lands. Plasmashell binds a
+    /// re-announced wl_output asynchronously; destroying the only other
+    /// output in the same breath races that bind — Qt sees zero outputs,
+    /// creates its placeholder screen, and (KWin 6.7-era shells) never
+    /// re-latches (field-observed: every reconnect after a
+    /// resolution-change disconnect rendered a dead shell). The settle
+    /// window mirrors the engage settle.
+    ///
+    /// Idempotent: after the first call the guard holds nothing, and a
+    /// later Drop is a no-op.
+    pub async fn finish(&mut self) {
+        let names = std::mem::take(&mut self.disabled);
+        if names.is_empty() {
+            return;
+        }
+        restore_physical_outputs(&names, &self.exclude).await;
+        tokio::time::sleep(Duration::from_millis(750)).await;
+    }
 }
 
 impl Drop for OutputLayoutGuard {
@@ -842,67 +894,77 @@ impl Drop for OutputLayoutGuard {
         if names.is_empty() {
             return;
         }
-        // Enable, VERIFY, retry — mirrors engage. A bounced enable here is
-        // not cosmetic: it leaves the machine headless and plasmashell
-        // falls to its placeholder screen, NEVER re-latching onto later
-        // outputs (field-observed 2026-09-16: a re-enable that raced KWin's
-        // teardown of the just-destroyed virtual output bounced silently;
-        // the machine stayed headless and every subsequent session was a
-        // black screen with frames flowing). The old code also logged
-        // "re-enabled" unconditionally while ignoring enable_output's
-        // return value.
-        for name in &names {
+        restore_physical_outputs_blocking(&names, &exclude);
+    }
+}
+
+/// Verified restore (enable, settle, verify, retry once, truthful logs) —
+/// the async entry for [`OutputLayoutGuard::finish`]. A bounced enable is
+/// not cosmetic: it leaves the machine headless and plasmashell falls to
+/// its placeholder screen, NEVER re-latching onto later outputs
+/// (field-observed: a re-enable that raced KWin's teardown of the
+/// just-destroyed virtual output bounced silently; the machine stayed
+/// headless and every subsequent session was a black screen with frames
+/// flowing).
+async fn restore_physical_outputs(names: &[String], exclude: &str) {
+    let names0 = names.to_vec();
+    let exclude0 = exclude.to_string();
+    tokio::task::spawn_blocking(move || restore_physical_outputs_blocking(&names0, &exclude0))
+        .await
+        .ok();
+}
+
+/// Blocking core shared by Drop and [`restore_physical_outputs`].
+fn restore_physical_outputs_blocking(names: &[String], exclude: &str) {
+    for name in names {
+        enable_output(name);
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    let still_disabled: Vec<String> = {
+        let enabled_now = list_enabled_physical_outputs(exclude);
+        names
+            .iter()
+            .filter(|n| !enabled_now.contains(n))
+            .cloned()
+            .collect()
+    };
+    if !still_disabled.is_empty() {
+        warn!(
+            "[kwin-virtual] re-enable bounced for [{}] — retrying once after settle",
+            still_disabled.join(", ")
+        );
+        for name in &still_disabled {
             enable_output(name);
         }
         std::thread::sleep(Duration::from_millis(300));
-        let still_disabled: Vec<String> = {
-            let ex = exclude.clone();
-            let enabled_now = list_enabled_physical_outputs(&ex);
-            names
-                .iter()
-                .filter(|n| !enabled_now.contains(n))
-                .cloned()
-                .collect()
-        };
-        if !still_disabled.is_empty() {
-            warn!(
-                "[kwin-virtual] re-enable bounced for [{}] — retrying once after settle",
-                still_disabled.join(", ")
-            );
-            for name in &still_disabled {
-                enable_output(name);
-            }
-            std::thread::sleep(Duration::from_millis(300));
-            let ex = exclude.clone();
-            let enabled_final = list_enabled_physical_outputs(&ex);
-            let stuck: Vec<String> = names
-                .iter()
-                .filter(|n| !enabled_final.contains(n))
-                .cloned()
-                .collect();
-            if !stuck.is_empty() {
-                error!(
-                    "[kwin-virtual] physical output(s) STILL disabled after retry: [{}] — the machine may be headless and plasmashell may be stuck on its placeholder screen",
-                    stuck.join(", ")
-                );
-            }
-            let restored: Vec<String> = names
-                .iter()
-                .filter(|n| enabled_final.contains(n))
-                .cloned()
-                .collect();
-            if !restored.is_empty() {
-                info!(
-                    "[kwin-virtual] physical output(s) re-enabled: [{}]",
-                    restored.join(", ")
-                );
-            }
-        } else {
-            info!(
-                "[kwin-virtual] physical output(s) re-enabled: [{}]",
-                names.join(", ")
+        let enabled_final = list_enabled_physical_outputs(exclude);
+        let stuck: Vec<String> = names
+            .iter()
+            .filter(|n| !enabled_final.contains(n))
+            .cloned()
+            .collect();
+        if !stuck.is_empty() {
+            error!(
+                "[kwin-virtual] physical output(s) STILL disabled after retry: [{}] — the machine may be headless and plasmashell may be stuck on its placeholder screen",
+                stuck.join(", ")
             );
         }
+        let restored: Vec<String> = names
+            .iter()
+            .filter(|n| enabled_final.contains(n))
+            .cloned()
+            .collect();
+        if !restored.is_empty() {
+            info!(
+                "[kwin-virtual] physical output(s) re-enabled: [{}]",
+                restored.join(", ")
+            );
+        }
+    } else {
+        info!(
+            "[kwin-virtual] physical output(s) re-enabled: [{}]",
+            names.join(", ")
+        );
     }
 }
 
@@ -979,6 +1041,27 @@ pub fn parse_enabled_physical_outputs(
     kscreen_text: &str,
     exclude_kscreen_name: &str,
 ) -> Vec<String> {
+    parse_physical_outputs(kscreen_text, exclude_kscreen_name, false)
+}
+
+/// Pure parser: enabled AND connected-but-disabled physical outputs.
+/// Used by the layout guard when it engages an already-headless layout:
+/// adopting the disabled physical outputs lets Drop re-enable them at
+/// release, so "engaged headless" cannot permanently wedge the console
+/// (the pre-fix behavior: engage found nothing ENABLED to snapshot, Drop
+/// had nothing to restore, and the machine stayed blind forever).
+pub fn parse_recoverable_physical_outputs(
+    kscreen_text: &str,
+    exclude_kscreen_name: &str,
+) -> Vec<String> {
+    parse_physical_outputs(kscreen_text, exclude_kscreen_name, true)
+}
+
+fn parse_physical_outputs(
+    kscreen_text: &str,
+    exclude_kscreen_name: &str,
+    include_disabled: bool,
+) -> Vec<String> {
     // kscreen-doctor colorizes its output unconditionally (even piped), so
     // ANSI escape sequences sit between the marker words and the values
     // (e.g. "\u{1b}[01;32mOutput: \u{1b}[0;0m1 Virtual-1"). Strip them
@@ -988,11 +1071,17 @@ pub fn parse_enabled_physical_outputs(
     let mut result = Vec::new();
     let mut current_name: Option<String> = None;
     let mut current_enabled = false;
+    let mut current_connected = false;
     for line in stripped.lines() {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix("Output: ") {
-            // Flush previous block.
-            if let (Some(name), true) = (&current_name, current_enabled)
+            // Flush previous block: enabled always qualifies; disabled
+            // only in the recoverable variant AND only when the connector
+            // is still connected (an absent display can't be re-enabled
+            // into anything useful).
+            let qualifies = current_enabled
+                || (include_disabled && current_connected && !current_enabled);
+            if let (Some(name), true) = (&current_name, qualifies)
                 && name != exclude_kscreen_name
             {
                 result.push(name.clone());
@@ -1009,13 +1098,19 @@ pub fn parse_enabled_physical_outputs(
                 .and_then(|(_, n)| n.split(' ').next())
                 .map(str::to_string);
             current_enabled = false;
+            current_connected = false;
         } else if line == "enabled" {
             current_enabled = true;
+        } else if line == "disabled" {
+            current_enabled = false;
+        } else if line == "connected" {
+            current_connected = true;
         }
     }
     // Flush the final block (no trailing "Output:" line).
-    if let (Some(name), true) = (&current_name, current_enabled)
-        && name != exclude_kscreen_name
+    let qualifies =
+        current_enabled || (include_disabled && current_connected && !current_enabled);
+    if let (Some(name), true) = (&current_name, qualifies) && name != exclude_kscreen_name
     {
         result.push(name.clone());
     }
@@ -1046,6 +1141,32 @@ pub fn strip_ansi(text: &str) -> String {
         }
     }
     out
+}
+
+/// Like [`list_enabled_physical_outputs`] but ALSO returns
+/// connected-but-disabled outputs (see
+/// [`parse_recoverable_physical_outputs`]).
+fn list_recoverable_physical_outputs(exclude_kscreen_name: &str) -> Vec<String> {
+    let out = match std::process::Command::new("kscreen-doctor")
+        .arg("-o")
+        .stdin(std::process::Stdio::null())
+        .output()
+    {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Ok(o) => {
+            warn!(
+                "[kwin-virtual] kscreen-doctor -o failed (exit {:?}): {}",
+                o.status.code(),
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            return Vec::new();
+        }
+        Err(e) => {
+            warn!("[kwin-virtual] cannot run kscreen-doctor: {e}");
+            return Vec::new();
+        }
+    };
+    parse_recoverable_physical_outputs(&out, exclude_kscreen_name)
 }
 
 /// Disable a kscreen output by connector name (blocking; returns success).
