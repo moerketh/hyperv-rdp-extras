@@ -259,9 +259,8 @@ impl VirtualOutputManager {
         info!(
             "[kwin-virtual] virtual output '{output_name}' @ {width}x{height} streaming on node {node_id}"
         );
-        // Enable is a best-effort blocking call on the kscreen tool; it is
-        // idempotent and a failure only risks the black-screen signature.
-        let enabled = tokio::task::spawn_blocking(move || enable_output(&kscreen_name))
+        let enable_kscreen = kscreen_name.clone();
+        let enabled = tokio::task::spawn_blocking(move || enable_output(&enable_kscreen))
             .await
             .unwrap_or(false);
         if enabled {
@@ -272,6 +271,33 @@ impl VirtualOutputManager {
                  session may show a black screen"
             );
         }
+        // NORMALIZE TO ORIGIN after every create — but DELAYED past the
+        // retiring output's settle-close. Two reasons:
+        // 1. KWin >= 6.7 parks a new virtual output beside the stale
+        //    geometry of other outputs — including the DISABLED physical
+        //    one AND the RETIRING virtual one on a resize (create-before-
+        //    close keeps it alive for SETTLE_CLOSE_MS). An immediate move
+        //    to (0,0) would overlap the retiring output at (0,0); kscreen
+        //    may refuse or revert overlapping positions. After the close,
+        //    the new output is the only one left and the move is clean.
+        // 2. KWin < 6.7 already normalized; the check is a cheap no-op.
+        // Layered with the guard's engage normalization and the fork's
+        // blank-capture heal; failures only log.
+        let norm_kscreen = kscreen_name.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(SETTLE_CLOSE_MS + Duration::from_millis(500)).await;
+            let name = norm_kscreen;
+            let norm = tokio::task::spawn_blocking(move || {
+                normalize_virtual_output_origin(&name)
+            })
+            .await
+            .unwrap_or(None);
+            if norm != Some((0, 0)) {
+                warn!(
+                    "[kwin-virtual] virtual output not verified at (0,0) after create settle ({norm:?}) — continuing"
+                );
+            }
+        });
         Ok(node_id)
     }
 
@@ -867,6 +893,27 @@ impl OutputLayoutGuard {
             // Only bookkeep the ones that actually disabled.
             names.retain(|n| !final_enabled.contains(n));
         }
+        // NORMALIZE the virtual output to (0,0) AFTER the physical
+        // disables: with the physical output's stale geometry vacated,
+        // KWin >= 6.7 may still have the virtual output parked beside
+        // the disabled output's old extent (it does not re-normalize;
+        // 6.3 did). plasmashell maps its desktop containment by screen
+        // — an off-origin virtual output gets no desktop rendered into
+        // it: uniformly blank capture on a healthy frame pipeline
+        // (measured live, Plasma 6.7.4). Verified-move with one retry;
+        // a failure logs and continues (the fork's blank-capture heal
+        // remains as backstop).
+        let norm_name = config.kscreen_name.clone();
+        let norm = tokio::task::spawn_blocking(move || {
+            normalize_virtual_output_origin(&norm_name)
+        })
+        .await
+        .unwrap_or(None);
+        if norm != Some((0, 0)) {
+            warn!(
+                "[kwin-virtual] virtual output not verified at (0,0) after engage ({norm:?})"
+            );
+        }
         Self {
             disabled: names,
             exclude: config.kscreen_name,
@@ -1198,6 +1245,305 @@ pub fn disable_output(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// A single output's kscreen geometry: position + mode size, and whether
+/// kscreen reports it enabled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputGeometry {
+    /// Connector name (first token after the index; KWin >= 6.7 appends a
+    /// UUID which is NOT part of the name).
+    pub name: String,
+    /// Enabled per kscreen.
+    pub enabled: bool,
+    /// Output position in the compositor's global layout space.
+    pub x: i32,
+    pub y: i32,
+    /// Mode size in pixels.
+    pub width: i32,
+    pub height: i32,
+}
+
+/// Pure parser: extract every output's geometry from `kscreen-doctor -o`
+/// text (ANSI-stripped first). Blocks look like:
+///
+/// ```text
+/// Output: 1 Virtual-lamco be96cb63-...
+///     enabled
+///     connected
+///     ...
+///     Geometry: 1920,0 1366x768
+/// ```
+///
+/// KWin < 6.7 has no UUID token; the parser takes the geometry line as a
+/// whole so both formats parse identically. Outputs without a Geometry
+/// line keep a zeroed geometry (they stay listed — callers match by name
+/// and never mistake them for ours).
+pub fn parse_output_geometries(kscreen_text: &str) -> Vec<OutputGeometry> {
+    let stripped = strip_ansi(kscreen_text);
+    let mut result = Vec::new();
+    let mut current: Option<OutputGeometry> = None;
+    for line in stripped.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("Output: ") {
+            if let Some(done) = current.take() {
+                result.push(done);
+            }
+            // "1 Virtual-lamco <uuid>" -> name is the token after the
+            // index only (UUID is metadata, never part of the name).
+            let name = rest
+                .split_once(' ')
+                .and_then(|(_, n)| n.split(' ').next())
+                .unwrap_or_default()
+                .to_string();
+            current = Some(OutputGeometry {
+                name,
+                enabled: false,
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+            });
+        } else if let Some(geo) = current.as_mut() {
+            if line == "enabled" {
+                geo.enabled = true;
+            } else if let Some(rest) = line.strip_prefix("Geometry: ") {
+                // "1920,0 1366x768" -> ((1920, 0), (1366, 768)).
+                let mut parts = rest.split_whitespace();
+                let pos = parts.next().unwrap_or_default();
+                let size = parts.next().unwrap_or_default();
+                let (x, y) = pos
+                    .split_once(',')
+                    .map(|(x, y)| {
+                        (
+                            x.trim().parse::<i32>().unwrap_or(0),
+                            y.trim().parse::<i32>().unwrap_or(0),
+                        )
+                    })
+                    .unwrap_or((0, 0));
+                let (w, h) = size
+                    .split_once('x')
+                    .map(|(w, h)| {
+                        (
+                            w.trim().parse::<i32>().unwrap_or(0),
+                            h.trim().parse::<i32>().unwrap_or(0),
+                        )
+                    })
+                    .unwrap_or((0, 0));
+                geo.x = x;
+                geo.y = y;
+                geo.width = w;
+                geo.height = h;
+            }
+        }
+    }
+    if let Some(done) = current.take() {
+        result.push(done);
+    }
+    result
+}
+
+/// List every output's geometry (blocking; empty on any kscreen failure).
+fn list_output_geometries() -> Vec<OutputGeometry> {
+    let out = match std::process::Command::new("kscreen-doctor")
+        .arg("-o")
+        .stdin(std::process::Stdio::null())
+        .output()
+    {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        _ => return Vec::new(),
+    };
+    parse_output_geometries(&out)
+}
+
+/// Move an output to a position via kscreen-doctor (blocking). Returns
+/// success of the COMMAND, not whether the position stuck — pair with
+/// [`list_output_geometries`] for verification.
+fn position_output(name: &str, x: i32, y: i32) -> bool {
+    std::process::Command::new("kscreen-doctor")
+        .arg(format!("output.{name}.position.{x},{y}"))
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Ensure our virtual output is the leftmost/topmost screen: position it
+/// at (0,0) and VERIFY the move stuck, retrying once. Returns the final
+/// verified position.
+///
+/// WHY this exists: KWin >= 6.7 positions a newly created virtual output
+/// to avoid overlapping other outputs in the layout — including DISABLED
+/// ones, whose stale geometry still occupies layout space. With the
+/// physical output disabled by the layout guard, the virtual output can
+/// end up parked at e.g. (1920,0), never normalized to the origin. KWin
+/// 6.3 auto-normalized; 6.7 does not. plasmashell then maps its desktop
+/// containment to the wrong screen and renders nothing — the capture is
+/// genuinely black while the frame pipeline logs healthy (measured live
+/// on Plasma 6.7.4: virtual output at (1920,0), client black at
+/// 327/330 frames acked).
+///
+/// On KWin versions that already normalize (6.3 et al.) the position
+/// command is a no-op move to where the output already sits — harmless.
+///
+/// Returns `None` when the output cannot be found or the position cannot
+/// be verified after retry — callers treat that as best-effort failure
+/// (log, continue; the heal path may still recover).
+fn normalize_virtual_output_origin(kscreen_name: &str) -> Option<(i32, i32)> {
+    let read = || {
+        list_output_geometries()
+            .into_iter()
+            .find(|g| g.name == kscreen_name && g.enabled)
+    };
+    let attempt = |retry_pending: bool| -> Option<(i32, i32)> {
+        let geo = read()?;
+        if geo.x == 0 && geo.y == 0 {
+            // Already normalized (KWin did it, or a previous call) — no
+            // command needed.
+            return Some((0, 0));
+        }
+        info!(
+            "[kwin-virtual] virtual output '{kscreen_name}' parked at {},{} — moving to (0,0) (KWin >= 6.7 keeps stale side-by-side positions; 6.3 normalized)",
+            geo.x, geo.y
+        );
+        if !position_output(kscreen_name, 0, 0) {
+            return None;
+        }
+        // Give KWin a beat to apply the move before verifying.
+        std::thread::sleep(Duration::from_millis(300));
+        let after = read()?;
+        if after.x == 0 && after.y == 0 {
+            info!("[kwin-virtual] virtual output '{kscreen_name}' normalized to (0,0)");
+            Some((0, 0))
+        } else if retry_pending {
+            None // caller retries once
+        } else {
+            warn!(
+                "[kwin-virtual] virtual output '{kscreen_name}' position move did not stick ({},{} after retry) — continuing best-effort",
+                after.x, after.y
+            );
+            Some((after.x, after.y))
+        }
+    };
+    attempt(true).or_else(|| attempt(false))
+}
+
+/// Restart plasmashell (blocking; returns whether a restart was issued
+/// and the process came back).
+///
+/// WHY: a plasmashell that has fallen to its placeholder screen (zero
+/// bound wl_outputs at its registry-event level) never re-latches onto
+/// later outputs — the desktop keeps rendering into the placeholder
+/// while the virtual output scans out an empty desktop. A restart is
+/// the only observed way to force a clean re-bind of every output
+/// (field-observed 2026-09-18: after moving the virtual output to the
+/// origin the capture stayed uniformly blank until plasmashell was
+/// restarted, then the desktop appeared within seconds).
+///
+/// Mechanism ladder (portable across Plasma launches):
+/// 1. `plasma-plasmashell.service` ACTIVE → `systemctl --user restart`
+///    (Plasma's own supervision respawns it; also correct for
+///    `--no-respawn` units).
+/// 2. Otherwise (unit inactive/dead, process dbus-launched via kstart):
+///    graceful `kquitapp6`, wait out exit, then `kstart` to relaunch
+///    inside the session. A hung shell gets TERM'd after the grace
+///    window.
+fn restart_plasmashell() -> bool {
+    use std::process::Command;
+    let run = |cmd: &str, args: &[&str]| {
+        Command::new(cmd)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    };
+    let plasmashell_alive = || run("pgrep", &["-x", "plasmashell"]);
+
+    if run("systemctl", &["--user", "is-active", "--quiet", "plasma-plasmashell.service"]) {
+        info!("[kwin-virtual] restarting plasmashell via systemd unit");
+        if run("systemctl", &["--user", "restart", "plasma-plasmashell.service"]) {
+            std::thread::sleep(Duration::from_millis(1500));
+            return plasmashell_alive();
+        }
+        return false;
+    }
+
+    info!("[kwin-virtual] restarting plasmashell via session (kquitapp6 + kstart)");
+    run("kquitapp6", &["plasmashell"]);
+    // Grace window for a clean exit (up to 5s).
+    for _ in 0..10 {
+        if !plasmashell_alive() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    if plasmashell_alive() {
+        // Hung shell: force TERM, wait again.
+        let _ = Command::new("pkill")
+            .args(["-TERM", "-x", "plasmashell"])
+            .stdin(std::process::Stdio::null())
+            .output();
+        for _ in 0..6 {
+            if !plasmashell_alive() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+    // Relaunch inside the session.
+    run("kstart", &["plasmashell"]);
+    // Wait for it to come up (up to 8s).
+    for _ in 0..16 {
+        if plasmashell_alive() {
+            info!("[kwin-virtual] plasmashell relaunched");
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    warn!("[kwin-virtual] plasmashell did not come back after relaunch");
+    false
+}
+
+/// One-shot compositor-side layout heal for the kwin-virtual strategy:
+/// normalize the virtual output to the origin, then restart plasmashell
+/// to force a clean output re-bind. Returns `true` when at least the
+/// origin normalization verified (0,0) — the restart is best-effort.
+///
+/// Safe to call repeatedly; each step is idempotent or guarded. Meant
+/// for the fork's blank-capture recovery path: frames flowing, encoder
+/// healthy, client acking — but the capture is uniformly blank because
+/// the desktop renders into the wrong screen (off-origin output) or a
+/// wedged placeholder (plasmashell).
+pub async fn heal_output_layout(kscreen_name: &str) -> bool {
+    let name = kscreen_name.to_string();
+    let normalized = tokio::task::spawn_blocking(move || {
+        normalize_virtual_output_origin(&name)
+    })
+    .await
+    .unwrap_or(None);
+    let normalized = match normalized {
+        Some(pos) => pos,
+        None => {
+            warn!(
+                "[kwin-virtual] layout heal: could not verify '{kscreen_name}' at origin — attempting plasmashell restart anyway"
+            );
+            (0, 0)
+        }
+    };
+    let restarted = tokio::task::spawn_blocking(restart_plasmashell)
+        .await
+        .unwrap_or(false);
+    info!(
+        x = normalized.0,
+        y = normalized.1,
+        restarted,
+        "[kwin-virtual] layout heal complete"
+    );
+    normalized == (0, 0)
+}
+
 /// Enable a kscreen output by connector name (blocking; returns success).
 pub fn enable_output(name: &str) -> bool {
     match std::process::Command::new("kscreen-doctor")
@@ -1225,6 +1571,84 @@ pub fn enable_output(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // === Geometry parsing (origin normalization) ===
+
+    #[test]
+    fn parses_geometries_with_uuid_and_without() {
+        // KWin >= 6.7 appends the output UUID after the name; 6.3 does
+        // not. Both must yield the same parsed geometry.
+        let text_67 = "\
+Output: 1 Virtual-lamco be96cb63-6649-4f1d-b22e-fce849119fe3
+    enabled
+    connected
+    priority 0
+    Modes: 1:1024x768@60
+    Geometry: 1920,0 1366x768
+Output: 2 Virtual-1 892482c9-0b93-4a86-b5ea-d1ddce3cb43b
+    disabled
+    Geometry: 0,0 1920x1080
+";
+        let text_63 = text_67
+            .replace(" be96cb63-6649-4f1d-b22e-fce849119fe3", "")
+            .replace(" 892482c9-0b93-4a86-b5ea-d1ddce3cb43b", "");
+        let expected = vec![
+            OutputGeometry {
+                name: "Virtual-lamco".into(),
+                enabled: true,
+                x: 1920,
+                y: 0,
+                width: 1366,
+                height: 768,
+            },
+            OutputGeometry {
+                name: "Virtual-1".into(),
+                enabled: false,
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+        ];
+        assert_eq!(parse_output_geometries(&text_67), expected);
+        assert_eq!(parse_output_geometries(&text_63), expected);
+    }
+
+    #[test]
+    fn geometry_parses_with_ansi_noise() {
+        // kscreen-doctor colorizes unconditionally; escapes sit between
+        // markers and values.
+        let text = "\u{1b}[01;32mOutput: \u{1b}[0;0m1 Virtual-lamco\n\t\u{1b}[01;32menabled\u{1b}[0;0m\n\t\u{1b}[01;34mGeometry: \u{1b}[0;0m 1920,0 1366x768\n";
+        let geos = parse_output_geometries(text);
+        assert_eq!(geos.len(), 1);
+        assert_eq!(geos[0].name, "Virtual-lamco");
+        assert!(geos[0].enabled);
+        assert_eq!((geos[0].x, geos[0].y), (1920, 0));
+        assert_eq!((geos[0].width, geos[0].height), (1366, 768));
+    }
+
+    #[test]
+    fn geometry_missing_outputs_and_negative_positions() {
+        // No Geometry line (not yet enumerated): output skipped, others
+        // unaffected. Negative positions must parse (outputs CAN sit at
+        // negative coordinates in multi-monitor layouts).
+        let text = "\
+Output: 1 DP-1
+    enabled
+Output: 2 Virtual-lamco
+    enabled
+    Geometry: -1920,0 1366x768
+";
+        let geos = parse_output_geometries(text);
+        // DP-1 IS included (zeroed geometry) — skipping entries would
+        // hide real outputs from the origin check; the find() callers
+        // match by name+enabled and never see it as ours.
+        assert_eq!(geos.len(), 2);
+        assert_eq!(geos[0].name, "DP-1");
+        assert_eq!((geos[0].x, geos[0].y, geos[0].width), (0, 0, 0));
+        assert_eq!(geos[1].name, "Virtual-lamco");
+        assert_eq!((geos[1].x, geos[1].y), (-1920, 0));
+    }
 
     // === Stream request machine invariants ===
 
