@@ -669,9 +669,10 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>, config: VirtualOutpu
         // Complete any settle-parked close: the replacement output has
         // had SETTLE_CLOSE_MS to be bound by clients; removing the old one
         // is now a plain output change instead of a zero-outputs window.
-        if let Some((parked, deadline)) = state.closing.take()
-            && std::time::Instant::now() >= deadline
-        {
+        // take_due_settle_close keeps the proxy parked until the deadline
+        // (a bare take() whose guard fails would drop the proxy without
+        // close(), leaking the old virtual output as a live zombie).
+        if let Some(parked) = take_due_settle_close(&mut state.closing) {
             parked.close();
             info!("[kwin-virtual] settled — previous stream destroyed after swap");
         }
@@ -690,6 +691,24 @@ fn outcome_to_reply(outcome: StreamOutcome) -> Result<u32, String> {
         StreamOutcome::Created { node } => Ok(node),
         StreamOutcome::Failed { reason } => Err(reason),
         StreamOutcome::Closed => Err("stream closed by compositor".to_string()),
+    }
+}
+
+/// Due-check for a settle-parked close: returns the parked item ONLY when
+/// its deadline has passed (removing it from the slot); before the deadline
+/// the item STAYS PARKED. Extracted from the poll loop so the bookkeeping
+/// is unit-testable: the original inline form
+/// (`if let Some(x) = closing.take() && now >= deadline`) consumed the
+/// proxy on EVERY not-yet-due poll iteration and silently dropped it when
+/// the guard failed — each swap leaked its old virtual output as a live
+/// zombie (panel theft, off-origin geometry, one zombie per resize;
+/// field-observed). The regression tests pin both behaviors.
+fn take_due_settle_close<T>(closing: &mut Option<(T, std::time::Instant)>) -> Option<T> {
+    let (_, deadline) = closing.as_ref()?;
+    if std::time::Instant::now() >= *deadline {
+        closing.take().map(|(item, _)| item)
+    } else {
+        None
     }
 }
 
@@ -1375,5 +1394,134 @@ Output: 2 Virtual-lamco
         let m = VirtualOutputManager::new();
         // close_stream on a fresh manager is a no-op (no thread yet).
         m.close_stream().await;
+    }
+
+    // === Settle-parked close bookkeeping ===
+
+    #[test]
+    fn settle_close_stays_parked_until_deadline() {
+        // REGRESSION: the original inline form consumed the proxy on every
+        // not-yet-due poll iteration (`if let Some(x) = take() && due`) and
+        // dropped it when the guard failed — one leaked virtual output per
+        // swap (zombie outputs stole the panel and shifted geometry).
+        let mut closing = Some(("old-stream", std::time::Instant::now() + SETTLE_CLOSE_MS));
+        // Simulate many fast poll passes before the deadline.
+        for _ in 0..10 {
+            assert!(take_due_settle_close(&mut closing).is_none());
+            // The item must still be parked, not dropped.
+            assert!(closing.is_some(), "parked close was dropped before its deadline");
+            assert_eq!(closing.as_ref().map(|(s, _)| *s), Some("old-stream"));
+        }
+    }
+
+    #[test]
+    fn settle_close_returns_once_when_due() {
+        let mut closing = Some(("old-stream", std::time::Instant::now() - Duration::from_millis(1)));
+        assert_eq!(take_due_settle_close(&mut closing), Some("old-stream"));
+        // Consumed exactly once; the slot is empty afterwards.
+        assert!(closing.is_none());
+        assert!(take_due_settle_close(&mut closing).is_none());
+    }
+
+    #[test]
+    fn settle_close_empty_slot_is_noop() {
+        let mut closing: Option<(u32, std::time::Instant)> = None;
+        assert!(take_due_settle_close(&mut closing).is_none());
+        assert!(closing.is_none());
+    }
+
+    #[test]
+    fn settle_window_mirrors_engage_settle() {
+        // The teardown settle exists for the same reason as the engage
+        // settle (clients bind wl_output globals asynchronously); the two
+        // windows are deliberately equal. If either changes deliberately,
+        // change both — and update this pin.
+        assert_eq!(SETTLE_CLOSE_MS, Duration::from_millis(750));
+    }
+
+    // === Recoverable-output parsing (headless-adoption support) ===
+
+    #[test]
+    fn recoverable_includes_disabled_but_connected() {
+        // A headless layout: the physical output is connected yet disabled
+        // (e.g. a previous wedge). The guard must be able to adopt it so
+        // Drop can re-enable the console.
+        let text = "\
+Output: 1 Virtual-1
+    disabled
+    connected
+Output: 2 Virtual-lamco
+    enabled
+";
+        assert_eq!(
+            parse_recoverable_physical_outputs(text, "Virtual-lamco"),
+            vec!["Virtual-1".to_string()]
+        );
+    }
+
+    #[test]
+    fn recoverable_still_includes_enabled_outputs() {
+        let text = "\
+Output: 1 Virtual-1
+    enabled
+    connected
+Output: 2 HDMI-A-1
+    disabled
+    connected
+";
+        assert_eq!(
+            parse_recoverable_physical_outputs(text, "Virtual-lamco"),
+            vec!["Virtual-1".to_string(), "HDMI-A-1".to_string()]
+        );
+    }
+
+    #[test]
+    fn recoverable_excludes_disconnected_outputs() {
+        // A disconnected connector cannot be re-enabled into anything
+        // useful; adopting it would make Drop's verified-restore log noise.
+        let text = "\
+Output: 1 HDMI-A-1
+    disabled
+Output: 2 Virtual-1
+    disabled
+    connected
+";
+        assert_eq!(
+            parse_recoverable_physical_outputs(text, "Virtual-lamco"),
+            vec!["Virtual-1".to_string()]
+        );
+    }
+
+    #[test]
+    fn recoverable_excludes_our_virtual_output() {
+        let text = "\
+Output: 1 Virtual-lamco
+    disabled
+    connected
+Output: 2 Virtual-1
+    disabled
+    connected
+";
+        assert_eq!(
+            parse_recoverable_physical_outputs(text, "Virtual-lamco"),
+            vec!["Virtual-1".to_string()]
+        );
+    }
+
+    #[test]
+    fn enabled_parser_never_returns_disabled_outputs() {
+        // The classic parser must remain enabled-only: the recoverable
+        // variant is exclusively for the headless-adoption path.
+        let text = "\
+Output: 1 Virtual-1
+    disabled
+    connected
+Output: 2 HDMI-A-1
+    enabled
+";
+        assert_eq!(
+            parse_enabled_physical_outputs(text, "Virtual-lamco"),
+            vec!["HDMI-A-1".to_string()]
+        );
     }
 }
