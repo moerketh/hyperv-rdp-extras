@@ -1506,17 +1506,94 @@ fn restart_plasmashell() -> bool {
     false
 }
 
-/// One-shot compositor-side layout heal for the kwin-virtual strategy:
-/// normalize the virtual output to the origin, then restart plasmashell
-/// to force a clean output re-bind. Returns `true` when at least the
-/// origin normalization verified (0,0) — the restart is best-effort.
+/// Reattach orphaned plasmashell desktop containments to the live screen
+/// (blocking; returns how many containments were reassigned).
 ///
-/// Safe to call repeatedly; each step is idempotent or guarded. Meant
-/// for the fork's blank-capture recovery path: frames flowing, encoder
-/// healthy, client acking — but the capture is uniformly blank because
-/// the desktop renders into the wrong screen (off-origin output) or a
-/// wedged placeholder (plasmashell).
-pub async fn heal_output_layout(kscreen_name: &str) -> bool {
+/// WHY: when the virtual output is destroyed and recreated (elastic
+/// resize), Plasma assigns the NEW output a fresh screen id — but the
+/// desktop containment stays glued to the OLD id, which no longer
+/// exists: `desktops()` then reports `screen: -1` for it. The result is
+/// the "windows floating on black, no panel" wedge: plasmashell runs,
+/// windows render, but wallpaper+panel never attach to the captured
+/// output. Verified live on Plasma 6.3.6 (Parrot): reassigning the
+/// orphaned containment via the shell scripting API restored the full
+/// desktop IMMEDIATELY mid-session (taskbar included) at sizes that had
+/// failed 10+ consecutive runs — no plasmashell restart needed (and a
+/// restart alone does NOT fix 6.3; the stale mapping survives it).
+///
+/// Mechanism: `org.kde.PlasmaShell.evaluateScript` on the session bus —
+/// `d[i].screen = 0` for every containment whose screen is negative.
+/// Screen 0 is the primary/live screen; Plasma deduplicates when both
+/// desktops land there. The server process runs as the session user
+/// (user systemd service), so the session bus is discoverable via
+/// XDG_RUNTIME_DIR.
+fn reattach_plasmashell_containments() -> u32 {
+    let script = "var d=desktops();var n=0;for(var i=0;i<d.length;i++){\
+                  if(d[i].screen<0){d[i].screen=0;n++}};print(n)";
+    let out = match std::process::Command::new("gdbus")
+        .args([
+            "call",
+            "--session",
+            "--dest",
+            "org.kde.plasmashell",
+            "--object-path",
+            "/PlasmaShell",
+            "--method",
+            "org.kde.PlasmaShell.evaluateScript",
+            script,
+        ])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output()
+    {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            warn!(
+                "[kwin-virtual] plasmashell evaluateScript failed (exit {:?}): {}",
+                o.status.code(),
+                err.lines().last().unwrap_or("").trim()
+            );
+            return 0;
+        }
+        Err(e) => {
+            // gdbus missing or bus unreachable — the restart escalation
+            // remains as the fallback.
+            warn!("[kwin-virtual] could not run gdbus for containment reattach: {e}");
+            return 0;
+        }
+    };
+    // Output looks like `(0,)' for a print of a number.
+    let n = out
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .trim()
+        .trim_matches(',')
+        .trim()
+        .parse::<u32>()
+        .unwrap_or(0);
+    if n > 0 {
+        info!(
+            "[kwin-virtual] reattached {n} orphaned plasmashell containment(s) to the live screen"
+        );
+    }
+    n
+}
+
+/// One-shot compositor-side layout heal for the kwin-virtual strategy:
+/// normalize the virtual output to the origin, reattach orphaned desktop
+/// containments, and (escalation only) restart plasmashell. Returns
+/// `true` when the origin normalization verified (0,0).
+///
+/// `escalate_restart` is set by the caller on REPEAT heals (the first
+/// heal is the surgical path: origin + containment reattach, which
+/// fixes both observed fault families — 6.3's orphaned containment and
+/// 6.7's wedged-shell states — without disrupting the desktop). A
+/// restart is a 40s sledgehammer that does not even restore 6.3's
+/// containment mapping, so it is reserved for faults the surgical path
+/// could not fix.
+pub async fn heal_output_layout(kscreen_name: &str, escalate_restart: bool) -> bool {
     let name = kscreen_name.to_string();
     let normalized = tokio::task::spawn_blocking(move || {
         normalize_virtual_output_origin(&name)
@@ -1527,17 +1604,27 @@ pub async fn heal_output_layout(kscreen_name: &str) -> bool {
         Some(pos) => pos,
         None => {
             warn!(
-                "[kwin-virtual] layout heal: could not verify '{kscreen_name}' at origin — attempting plasmashell restart anyway"
+                "[kwin-virtual] layout heal: could not verify '{kscreen_name}' at origin — continuing with containment reattach"
             );
             (0, 0)
         }
     };
-    let restarted = tokio::task::spawn_blocking(restart_plasmashell)
+    // Surgical containment reattach FIRST — instant, no disruption, and
+    // the only thing that fixes Plasma 6.3's orphaned containment.
+    let reattached = tokio::task::spawn_blocking(reattach_plasmashell_containments)
         .await
-        .unwrap_or(false);
+        .unwrap_or(0);
+    let restarted = if escalate_restart {
+        tokio::task::spawn_blocking(restart_plasmashell)
+            .await
+            .unwrap_or(false)
+    } else {
+        false
+    };
     info!(
         x = normalized.0,
         y = normalized.1,
+        reattached,
         restarted,
         "[kwin-virtual] layout heal complete"
     );
