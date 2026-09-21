@@ -315,13 +315,11 @@ impl VirtualOutputManager {
                 )
                 .await
                 .unwrap_or(0);
-                if adopted > 0 {
-                    info!(
-                        adopted,
-                        delay_ms,
-                        "[kwin-virtual] proactively reattached orphaned desktop containment after create"
-                    );
-                }
+                info!(
+                    adopted,
+                    delay_ms,
+                    "[kwin-virtual] proactive containment reattach pass complete"
+                );
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
             let name = norm_kscreen;
@@ -1612,19 +1610,59 @@ fn reattach_plasmashell_containments() -> u32 {
             return 0;
         }
     };
-    // Output looks like `(0,)' for a print of a number.
-    let n = out
-        .trim()
+    // Output looks like `(0,)' for a print of a number. A failed parse
+    // means the script returned something unexpected — treat as 0 but
+    // LOG the raw value: the adoption decision is otherwise a black
+    // box from the outside (measured: k31 runs showed no line at all
+    // and the reason was indeterminable).
+    let raw = out.trim();
+    let n = raw
         .trim_start_matches('(')
         .trim_end_matches(')')
         .trim()
         .trim_matches(',')
         .trim()
         .parse::<u32>()
-        .unwrap_or(0);
+        .unwrap_or_else(|_| {
+            warn!(
+                raw,
+                "[kwin-virtual] containment reattach script returned unparseable output"
+            );
+            0
+        });
     if n > 0 {
         info!(
             "[kwin-virtual] reattached {n} orphaned plasmashell containment(s) to the live screen"
+        );
+    } else {
+        // Distinguish the benign skip from the suspicious one:
+        // occupied = a containment already owns screen 0 (healthy or
+        // duplicate-spawned); no orphan = nothing to adopt.
+        let probe = "var d=desktops();var occ=-1;var orph=-1;\
+                     for(var i=0;i<d.length;i++){\
+                     if(d[i].screen===0){occ=d[i].id}\
+                     if(d[i].screen<0){orph=d[i].id}}\
+                     print(occ+'+'+orph)";
+        let state = std::process::Command::new("gdbus")
+            .args([
+                "call",
+                "--session",
+                "--dest",
+                "org.kde.plasmashell",
+                "--object-path",
+                "/PlasmaShell",
+                "--method",
+                "org.kde.PlasmaShell.evaluateScript",
+                probe,
+            ])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        tracing::debug!(
+            "[kwin-virtual] containment reattach adopted nothing (state: {})",
+            state.trim()
         );
     }
     n
