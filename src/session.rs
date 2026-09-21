@@ -285,7 +285,45 @@ impl VirtualOutputManager {
         // blank-capture heal; failures only log.
         let norm_kscreen = kscreen_name.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(SETTLE_CLOSE_MS + Duration::from_millis(500)).await;
+            // PROACTIVE CONTAINMENT REATTACH, twice:
+            //
+            // Every output recreate gives the replacement a fresh screen
+            // id; the desktop containment stays glued to the DEAD one and
+            // plasmashell re-latches only after its async output-bind —
+            // on Plasma 6.3/6.7 measured as: either nothing adopts the
+            // new screen (panel-less wedge) or Plasma spawns a REPLACEMENT
+            // containment with DEFAULT wallpaper (the churned-Parrot
+            // "generic KDE background"). Re-adopting the ORIGINAL
+            // containment early — before Plasma manufactures a
+            // duplicate — keeps the user's desktop (wallpaper, panel,
+            // icon positions) and cuts the visible relayout from ~20s
+            // (settle-gated fault heal) to ~2s.
+            //
+            // Two passes: t1 = SETTLE_CLOSE_MS (750ms, right as the
+            // retiring output closes) catches the fastest re-creates;
+            // t2 = +3.3s catches slow binds (KWin 6.7 observed adopting
+            // up to ~3s after close). The adoption rule inside skips
+            // when screen 0 is already occupied, so a healthy layout is
+            // never disturbed — at most one gdbus round-trip is wasted.
+            for delay_ms in [
+                SETTLE_CLOSE_MS.as_millis() as u64,
+                SETTLE_CLOSE_MS.as_millis() as u64 + 2_500,
+            ] {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                let adopted = tokio::task::spawn_blocking(
+                    reattach_plasmashell_containments,
+                )
+                .await
+                .unwrap_or(0);
+                if adopted > 0 {
+                    info!(
+                        adopted,
+                        delay_ms,
+                        "[kwin-virtual] proactively reattached orphaned desktop containment after create"
+                    );
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
             let name = norm_kscreen;
             let norm = tokio::task::spawn_blocking(move || {
                 normalize_virtual_output_origin(&name)
@@ -1507,7 +1545,7 @@ fn restart_plasmashell() -> bool {
 }
 
 /// Reattach orphaned plasmashell desktop containments to the live screen
-/// (blocking; returns how many containments were reassigned).
+/// (blocking; returns how many containments were adopted).
 ///
 /// WHY: when the virtual output is destroyed and recreated (elastic
 /// resize), Plasma assigns the NEW output a fresh screen id — but the
@@ -1521,15 +1559,26 @@ fn restart_plasmashell() -> bool {
 /// failed 10+ consecutive runs — no plasmashell restart needed (and a
 /// restart alone does NOT fix 6.3; the stale mapping survives it).
 ///
-/// Mechanism: `org.kde.PlasmaShell.evaluateScript` on the session bus —
-/// `d[i].screen = 0` for every containment whose screen is negative.
-/// Screen 0 is the primary/live screen; Plasma deduplicates when both
-/// desktops land there. The server process runs as the session user
-/// (user systemd service), so the session bus is discoverable via
-/// XDG_RUNTIME_DIR.
+/// ADOPTION RULE: an orphan is adopted ONLY when no desktop containment
+/// currently sits on screen 0. When one does, Plasma has already spun
+/// up a replacement (with DEFAULT wallpaper — the churned-Parrot
+/// "generic KDE background") and blindly adopting the orphan would
+/// put two containments on one screen; Plasma then evicts one
+/// arbitrarily and can bounce them per session (measured: a forced
+/// swap reverted at the next session). The duplicate-containment case
+/// is prevented instead — by the proactive reattach after every
+/// create (see `recreate_stream`), which re-adopts the original before
+/// Plasma ever creates a replacement.
 fn reattach_plasmashell_containments() -> u32 {
-    let script = "var d=desktops();var n=0;for(var i=0;i<d.length;i++){\
-                  if(d[i].screen<0){d[i].screen=0;n++}};print(n)";
+    let script = "var d=desktops();var occupied=false;var best=-1;\
+                  for(var i=0;i<d.length;i++){\
+                  if(d[i].screen===0){occupied=true}\
+                  if(d[i].screen<0&&(best<0||d[i].id<best)){best=d[i].id}}\
+                  var n=0;\
+                  if(!occupied&&best>=0){\
+                  for(var j=0;j<d.length;j++){\
+                  if(d[j].id===best){d[j].screen=0;n=1}}}\
+                  print(n)";
     let out = match std::process::Command::new("gdbus")
         .args([
             "call",
