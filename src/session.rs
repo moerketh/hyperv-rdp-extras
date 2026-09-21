@@ -1610,18 +1610,14 @@ fn reattach_plasmashell_containments() -> u32 {
             return 0;
         }
     };
-    // Output looks like `(0,)' for a print of a number. A failed parse
-    // means the script returned something unexpected — treat as 0 but
-    // LOG the raw value: the adoption decision is otherwise a black
-    // box from the outside (measured: k31 runs showed no line at all
-    // and the reason was indeterminable).
+    // Output looks like `('0',)` / `('1',)` — gdbus wraps the printed
+    // value in a GVariant tuple: parens, single quotes, trailing comma.
+    // Strip ALL of them (the original trim chain missed the quotes, so
+    // every result parsed as failure and the adoption count was lost —
+    // measured on Kali r32: raw "('1',)" reported as unparseable).
     let raw = out.trim();
     let n = raw
-        .trim_start_matches('(')
-        .trim_end_matches(')')
-        .trim()
-        .trim_matches(',')
-        .trim()
+        .trim_matches(|c: char| !c.is_ascii_digit())
         .parse::<u32>()
         .unwrap_or_else(|_| {
             warn!(
