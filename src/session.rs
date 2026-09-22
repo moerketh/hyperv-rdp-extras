@@ -1557,23 +1557,33 @@ fn restart_plasmashell() -> bool {
 /// failed 10+ consecutive runs — no plasmashell restart needed (and a
 /// restart alone does NOT fix 6.3; the stale mapping survives it).
 ///
-/// ADOPTION RULE: an orphan is adopted ONLY when no desktop containment
-/// currently sits on screen 0. When one does, Plasma has already spun
-/// up a replacement (with DEFAULT wallpaper — the churned-Parrot
-/// "generic KDE background") and blindly adopting the orphan would
-/// put two containments on one screen; Plasma then evicts one
-/// arbitrarily and can bounce them per session (measured: a forced
-/// swap reverted at the next session). The duplicate-containment case
-/// is prevented instead — by the proactive reattach after every
-/// create (see `recreate_stream`), which re-adopts the original before
-/// Plasma ever creates a replacement.
+/// ADOPTION RULE: the LOWEST-ID desktop containment owns screen 0. The
+/// original desktop containment is the first one Plasma creates, so it
+/// carries the lowest id; any replacement Plasma spins up later (with
+/// DEFAULT wallpaper — the churned "generic KDE background") gets a
+/// higher id. Two cases:
+///
+///   * Screen 0 empty + orphan present  → adopt the lowest-id orphan
+///     (the 6.3 panel-less wedge; the original behavior).
+///   * Screen 0 held by a HIGHER-id containment while a lower-id one
+///     exists  → the occupant is the churn duplicate; reassign the
+///     lower-id (original) containment to screen 0. Plasma evicts the
+///     displaced duplicate to screen -1, restoring the user's real
+///     desktop over the generic one. Verified live on Kali/KWin 6.7.4:
+///     writing `d[i].screen = 0` swaps the two containments cleanly and
+///     the result is stable (the duplicate does not bounce back).
+///
+/// On a healthy single-containment layout the lowest-id containment
+/// already sits on screen 0, so this is a strict no-op — confirmed live
+/// across first connect, repeated/rapid resizes, and even a plasmashell
+/// restart, none of which spawn a duplicate. That makes the rule safe to
+/// run proactively after every create (see `recreate_stream`).
 fn reattach_plasmashell_containments() -> u32 {
-    let script = "var d=desktops();var occupied=false;var best=-1;\
+    let script = "var d=desktops();var best=-1;var bestScreen=0;\
                   for(var i=0;i<d.length;i++){\
-                  if(d[i].screen===0){occupied=true}\
-                  if(d[i].screen<0&&(best<0||d[i].id<best)){best=d[i].id}}\
+                  if(best<0||d[i].id<best){best=d[i].id;bestScreen=d[i].screen}}\
                   var n=0;\
-                  if(!occupied&&best>=0){\
+                  if(best>=0&&bestScreen!==0){\
                   for(var j=0;j<d.length;j++){\
                   if(d[j].id===best){d[j].screen=0;n=1}}}\
                   print(n)";
@@ -1628,12 +1638,13 @@ fn reattach_plasmashell_containments() -> u32 {
         });
     if n > 0 {
         info!(
-            "[kwin-virtual] reattached {n} orphaned plasmashell containment(s) to the live screen"
+            "[kwin-virtual] reassigned the lowest-id desktop containment to the live screen (displacing any higher-id duplicate)"
         );
     } else {
-        // Distinguish the benign skip from the suspicious one:
-        // occupied = a containment already owns screen 0 (healthy or
-        // duplicate-spawned); no orphan = nothing to adopt.
+        // Distinguish the benign no-op from a suspicious one:
+        // occ == lowest orphan (or no orphan) = screen 0 already held by
+        // the correct containment / nothing to do; occ < a present
+        // orphan would mean the rule failed to fire.
         let probe = "var d=desktops();var occ=-1;var orph=-1;\
                      for(var i=0;i<d.length;i++){\
                      if(d[i].screen===0){occ=d[i].id}\
