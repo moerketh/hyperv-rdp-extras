@@ -34,6 +34,8 @@ pub mod cursor;
 #[cfg(feature = "geometry")]
 pub mod geometry;
 #[cfg(feature = "kwin-virtual")]
+pub mod protocols;
+#[cfg(feature = "kwin-virtual")]
 pub mod session;
 #[cfg(feature = "transport")]
 pub mod transport;
