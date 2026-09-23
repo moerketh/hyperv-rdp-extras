@@ -809,6 +809,12 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>, config: VirtualOutpu
                 _ => {}
             }
         }
+
+        // The `output` event (opcode 1) carries a new_id<kde_output_device_v2>;
+        // wayland-client requires this specialization instead of panicking.
+        wayland_client::event_created_child!(State, KdeOutputDeviceRegistryV2, [
+            1 => (KdeOutputDeviceV2, ()),
+        ]);
     }
 
     impl Dispatch<KdeOutputDeviceV2, ()> for State {
@@ -861,6 +867,12 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>, config: VirtualOutpu
                 _ => {}
             }
         }
+
+        // The `mode` event (opcode 2) carries a new_id<kde_output_device_mode_v2>;
+        // wayland-client requires this specialization instead of panicking.
+        wayland_client::event_created_child!(State, KdeOutputDeviceV2, [
+            2 => (KdeOutputDeviceModeV2, ()),
+        ]);
     }
 
     impl Dispatch<KdeOutputDeviceModeV2, ()> for State {
