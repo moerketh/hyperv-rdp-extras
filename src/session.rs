@@ -85,6 +85,11 @@ pub const STREAM_CREATE_TIMEOUT: Duration = Duration::from_secs(10);
     /// (never re-latches; field-observed during resize churn). Mirrors the
     /// layout guard's engage settle window.
     pub const SETTLE_CLOSE_MS: Duration = Duration::from_millis(750);
+
+/// Deadline for an in-place mode-change transaction (experiment D): TX1
+/// (inject custom mode) + TX2 (set mode) must conclude within this window
+/// or the attempt reports [`ModeChangeOutcome::Timeout`].
+pub const MODE_CHANGE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Commands sent to the Wayland connection thread.
 enum WlCommand {
     /// Create a virtual output at the given size; replies with the PipeWire
@@ -94,8 +99,41 @@ enum WlCommand {
         height: i32,
         reply: tokio::sync::oneshot::Sender<Result<u32, String>>,
     },
+    /// Switch the LIVE virtual output to the given size via an in-place
+    /// mode change (no output destroy/recreate); replies when KWin's
+    /// configuration transaction concludes.
+    ChangeMode {
+        width: i32,
+        height: i32,
+        reply: tokio::sync::oneshot::Sender<ModeChangeOutcome>,
+    },
     /// Close the current stream (destroys the virtual output server-side).
     Close,
+}
+
+/// Outcome of an in-place virtual-output mode change attempt (experiment
+/// D: `kde_output_management_v2` custom modes, KWin >= 6.7). Distinct from
+/// a plain `Result` so the caller can pick the fallback policy: everything
+/// except [`ModeChangeOutcome::Applied`] falls back to
+/// [`VirtualOutputManager::recreate_stream`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModeChangeOutcome {
+    /// KWin applied the mode change in place: the SAME output and PipeWire
+    /// node keep streaming at the new size — no output add/remove, no
+    /// containment churn, no settle-close swap.
+    Applied,
+    /// The compositor does not advertise the kde-output-management-v2
+    /// protocol family (not KWin, or KWin too old).
+    NotAdvertised,
+    /// The protocol family is present but this output cannot switch modes
+    /// in place (interface bound below v18, the device lacks the
+    /// custom-modes capability, or the output's device was never
+    /// discovered). Carries the precise reason for observability.
+    Unsupported(&'static str),
+    /// The compositor refused a configuration transaction.
+    Failed(String),
+    /// No conclusive reply within [`MODE_CHANGE_TIMEOUT`].
+    Timeout,
 }
 
 // ============================================================================
@@ -337,6 +375,41 @@ impl VirtualOutputManager {
         Ok(node_id)
     }
 
+    /// Experiment D: switch the LIVE virtual output to a new size via
+    /// `kde_output_management_v2` custom modes (KWin >= 6.7), keeping the
+    /// output, its PipeWire node id, and the desktop layout intact — no
+    /// output add/remove, so plasmashell sees only a geometry change
+    /// (containment + panel stay latched, wallpaper survives).
+    ///
+    /// Returns a distinct [`ModeChangeOutcome`]; every outcome except
+    /// [`ModeChangeOutcome::Applied`] means the output was untouched and
+    /// the caller must fall back to [`Self::recreate_stream`].
+    pub async fn try_change_mode_in_place(
+        &self,
+        width: u16,
+        height: u16,
+    ) -> ModeChangeOutcome {
+        let Ok(tx) = self.ensure_wl_thread().await else {
+            return ModeChangeOutcome::Failed("zkde-screencast thread unavailable".into());
+        };
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        if tx
+            .send(WlCommand::ChangeMode {
+                width: width as i32,
+                height: height as i32,
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            return ModeChangeOutcome::Failed("zkde-screencast thread exited".into());
+        }
+        match tokio::time::timeout(MODE_CHANGE_TIMEOUT, reply_rx).await {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(_)) => ModeChangeOutcome::Failed("mode-change reply dropped".into()),
+            Err(_) => ModeChangeOutcome::Timeout,
+        }
+    }
+
     /// Close the current stream — KWin destroys the virtual output on
     /// stream close.
     pub async fn close_stream(&self) {
@@ -357,13 +430,39 @@ impl Default for VirtualOutputManager {
 // ============================================================================
 
 fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>, config: VirtualOutputConfig) {
-    use wayland_client::{Connection, Dispatch, QueueHandle, protocol::wl_registry};
+    use wayland_client::{
+        Connection, Dispatch, Proxy as _, QueueHandle, WEnum, protocol::wl_registry,
+    };
 
     use wayland_protocols_plasma::screencast::v1::client::{
         zkde_screencast_stream_unstable_v1::Event as StreamEvent,
         zkde_screencast_stream_unstable_v1::ZkdeScreencastStreamUnstableV1,
         zkde_screencast_unstable_v1::{Event as ManagerEvent, Pointer, ZkdeScreencastUnstableV1},
     };
+
+    use crate::protocols::{
+        output_device::v2::client::{
+            kde_output_device_mode_v2::{Event as DeviceModeEvent, KdeOutputDeviceModeV2},
+            kde_output_device_registry_v2::{
+                Event as DeviceRegistryEvent, KdeOutputDeviceRegistryV2,
+            },
+            kde_output_device_v2::{Event as DeviceEvent, KdeOutputDeviceV2},
+        },
+        output_management::v2::client::{
+            kde_mode_list_v2::{Event as ModeListEvent, KdeModeListV2},
+            kde_output_configuration_v2::{
+                Event as ConfigurationEvent, KdeOutputConfigurationV2,
+            },
+            kde_output_management_v2::KdeOutputManagementV2,
+        },
+    };
+
+    /// The custom-modes capability bit (`kde_output_management_v2` v18+,
+    /// `kde_output_device_v2::capability`).
+    const CAP_CUSTOM_MODES: u32 = 0x2000;
+    /// Minimum `kde_output_management_v2` version offering
+    /// `create_configuration.set_custom_modes`.
+    const MGMT_V_CUSTOM_MODES: u32 = 18;
 
     /// Pending request: the stream proxy + where to send the result. The
     /// reply is consumed on the FIRST conclusive event; the proxy itself
@@ -375,6 +474,49 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>, config: VirtualOutpu
         ZkdeScreencastStreamUnstableV1,
         Option<tokio::sync::oneshot::Sender<Result<u32, String>>>,
     );
+
+    /// One announced virtual/physical output device with the attributes
+    /// relevant to in-place mode changes.
+    struct DeviceTrack {
+        device: KdeOutputDeviceV2,
+        name: String,
+        capabilities: u32,
+        modes: Vec<ModeTrack>,
+    }
+
+    /// One announced mode object of a device.
+    struct ModeTrack {
+        proxy: KdeOutputDeviceModeV2,
+        width: i32,
+        height: i32,
+        refresh: i32,
+        removed: bool,
+    }
+
+    /// Which transaction of the in-place mode change is in flight.
+    enum ModeChangeStep {
+        /// TX1: inject the custom mode into the device's mode list and
+        /// wait for `applied` (followed by a re-announcement of the new
+        /// mode object on the device).
+        Tx1CustomModes { modelist: KdeModeListV2 },
+        /// TX2: select the (now known) mode object on the device. The TX1
+        /// modelist is retained so it can be destroyed at conclusion.
+        Tx2SetMode { modelist: KdeModeListV2 },
+    }
+
+    /// An in-flight in-place mode change.
+    struct ModeChangeTxn {
+        target: (i32, i32),
+        reply: tokio::sync::oneshot::Sender<ModeChangeOutcome>,
+        cfg: KdeOutputConfigurationV2,
+        step: ModeChangeStep,
+        /// Set when TX1's `applied` arrived; TX2 starts once BOTH this and
+        /// the re-announced mode object are in hand (either order).
+        tx1_applied: bool,
+        /// Debug string of the last failure_reason event, if any.
+        failure_reason: Option<String>,
+        deadline: std::time::Instant,
+    }
 
     /// Per-thread dispatch state.
     struct State {
@@ -400,7 +542,87 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>, config: VirtualOutpu
         )>,
         /// Stream request state machine (conclusive-event bookkeeping).
         stream_sm: StreamRequestMachine,
+        /// kde_output_management_v2 proxy + bound version (experiment D).
+        mgmt: Option<(KdeOutputManagementV2, u32)>,
+        /// kde_output_device_registry_v2 (v21+; device discovery).
+        device_registry: Option<KdeOutputDeviceRegistryV2>,
+        /// All devices announced by the registry.
+        devices: Vec<DeviceTrack>,
+        /// In-flight in-place mode change, if any.
+        mode_change: Option<ModeChangeTxn>,
+        /// Our output's kscreen connector name (`Virtual-{name}`); the
+        /// device lookup key — nested Dispatch impls cannot capture the
+        /// thread's `config`, so the name lives in the state.
+        kscreen_name: String,
     }
+
+    /// Find the tracked device for our virtual output by its kscreen name.
+    fn find_device<'a>(state: &'a mut State) -> Option<&'a mut DeviceTrack> {
+        let wanted = state.kscreen_name.clone();
+        state.devices.iter_mut().find(|d| d.name == wanted)
+    }
+
+    /// Try to start TX2: requires TX1 applied AND the target mode object
+    /// re-announced on the device. Returns true when TX2 was sent.
+    fn try_start_tx2(state: &mut State, qh: &QueueHandle<State>) -> bool {
+        let Some(mgmt) = state.mgmt.as_ref().map(|m| m.0.clone()) else {
+            return false;
+        };
+        let txn = match state.mode_change.as_mut() {
+            Some(t) => t,
+            None => return false,
+        };
+        if !matches!(txn.step, ModeChangeStep::Tx1CustomModes { .. }) || !txn.tx1_applied {
+            return false;
+        }
+        let (tw, th) = txn.target;
+        let Some(mode_proxy) = find_device(state).and_then(|d| {
+            d.modes
+                .iter()
+                .filter(|m| !m.removed && m.width == tw && m.height == th)
+                .max_by_key(|m| m.refresh)
+                .map(|m| m.proxy.clone())
+        }) else {
+            return false;
+        };
+        // TX1 concluded: destroy the old configuration proxy, keep the
+        // modelist alive for destruction at final conclusion.
+        let (old_cfg, modelist) = {
+            let txn = state.mode_change.as_mut().unwrap();
+            let ml = match &mut txn.step {
+                ModeChangeStep::Tx1CustomModes { modelist } => modelist.clone(),
+                ModeChangeStep::Tx2SetMode { .. } => return false,
+            };
+            (txn.cfg.clone(), ml)
+        };
+        old_cfg.destroy();
+        let cfg2 = mgmt.create_configuration(qh, ());
+        let device = find_device(state).unwrap().device.clone();
+        cfg2.mode(&device, &mode_proxy);
+        cfg2.apply();
+        let txn = state.mode_change.as_mut().unwrap();
+        txn.cfg = cfg2;
+        txn.step = ModeChangeStep::Tx2SetMode { modelist };
+        info!(
+            "[kwin-virtual] in-place mode change TX2: set {}x{} on output",
+            txn.target.0, txn.target.1
+        );
+        true
+    }
+
+    /// Conclude the in-flight mode change: deliver the outcome and tear
+    /// down the transaction's proxies (failure/timeout path).
+    fn abort_mode_change(state: &mut State, outcome: ModeChangeOutcome) {
+        if let Some(txn) = state.mode_change.take() {
+            match &txn.step {
+                ModeChangeStep::Tx1CustomModes { modelist }
+                | ModeChangeStep::Tx2SetMode { modelist } => modelist.destroy(),
+            }
+            txn.cfg.destroy();
+            let _ = txn.reply.send(outcome);
+        }
+    }
+
 
     impl Dispatch<wl_registry::WlRegistry, ()> for State {
         fn event(
@@ -411,13 +633,15 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>, config: VirtualOutpu
             _: &Connection,
             qh: &QueueHandle<Self>,
         ) {
-            if let wl_registry::Event::Global {
+            let wl_registry::Event::Global {
                 name,
                 interface,
                 version,
             } = event
-                && interface == "zkde_screencast_unstable_v1"
-            {
+            else {
+                return;
+            };
+            if interface == "zkde_screencast_unstable_v1" {
                 // KWin advertises version 6; the plasma bindings (XML
                 // v4) cap us at 4 — bind min(server, 4).
                 let bind_version = version.min(4);
@@ -426,6 +650,28 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>, config: VirtualOutpu
                 state.screencast = Some(screencast);
                 info!(
                     "[kwin-virtual] bound zkde_screencast_unstable_v1 (global v{version}, bound v{bind_version})"
+                );
+            } else if interface == "kde_output_management_v2" {
+                // Experiment D: cap at the vendored XML's v22. KWin 6.7
+                // advertises v21; KWin < 6.7 binds below v18 and reports
+                // Unsupported on use (no set_custom_modes there).
+                let bind_version = version.min(22);
+                let mgmt = registry.bind::<KdeOutputManagementV2, _, State>(name, bind_version, qh, ());
+                state.mgmt = Some((mgmt, bind_version));
+                info!(
+                    "[kwin-virtual] bound kde_output_management_v2 (global v{version}, bound v{bind_version})"
+                );
+            } else if interface == "kde_output_device_registry_v2" {
+                // Devices via registry exist only at v21+ (KWin >= 6.7
+                // advertises v23). Below that KWin exposes devices as
+                // plain globals — deliberately NOT handled; the in-place
+                // path reports NotAdvertised and the caller falls back.
+                let bind_version = version.min(25);
+                let devreg =
+                    registry.bind::<KdeOutputDeviceRegistryV2, _, State>(name, bind_version, qh, ());
+                state.device_registry = Some(devreg);
+                info!(
+                    "[kwin-virtual] bound kde_output_device_registry_v2 (global v{version}, bound v{bind_version})"
                 );
             }
         }
@@ -526,6 +772,221 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>, config: VirtualOutpu
         }
     }
 
+    // ---- experiment D: kde-output-management-v2 discovery + tracking ----
+
+    impl Dispatch<KdeOutputManagementV2, ()> for State {
+        fn event(
+            _: &mut Self,
+            _: &KdeOutputManagementV2,
+            _: crate::protocols::output_management::v2::client::kde_output_management_v2::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            // kde_output_management_v2 has no events.
+        }
+    }
+
+    impl Dispatch<KdeOutputDeviceRegistryV2, ()> for State {
+        fn event(
+            state: &mut Self,
+            _: &KdeOutputDeviceRegistryV2,
+            event: DeviceRegistryEvent,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            match event {
+                DeviceRegistryEvent::Output { output } => {
+                    state.devices.push(DeviceTrack {
+                        device: output,
+                        name: String::new(),
+                        capabilities: 0,
+                        modes: Vec::new(),
+                    });
+                }
+                // `finished` is a destructor; other events are unused.
+                _ => {}
+            }
+        }
+
+        // The `output` event (opcode 1) carries a new_id<kde_output_device_v2>;
+        // wayland-client requires this specialization instead of panicking.
+        wayland_client::event_created_child!(State, KdeOutputDeviceRegistryV2, [
+            1 => (KdeOutputDeviceV2, ()),
+        ]);
+    }
+
+    impl Dispatch<KdeOutputDeviceV2, ()> for State {
+        fn event(
+            state: &mut Self,
+            device: &KdeOutputDeviceV2,
+            event: DeviceEvent,
+            _: &(),
+            _: &Connection,
+            qh: &QueueHandle<Self>,
+        ) {
+            let Some(idx) = state.devices.iter().position(|d| d.device.id() == device.id())
+            else {
+                return;
+            };
+            match event {
+                DeviceEvent::Name { name } => state.devices[idx].name = name,
+                // `capability` is a bitfield enum: raw u32 bits.
+                DeviceEvent::Capabilities { flags } => {
+                    state.devices[idx].capabilities = match flags {
+                        WEnum::Value(c) => c.bits(),
+                        WEnum::Unknown(raw) => raw,
+                    };
+                }
+                DeviceEvent::Mode { mode } => {
+                    state.devices[idx].modes.push(ModeTrack {
+                        proxy: mode,
+                        width: 0,
+                        height: 0,
+                        refresh: 0,
+                        removed: false,
+                    });
+                }
+                DeviceEvent::Removed => {
+                    let removed = state.devices.remove(idx);
+                    if removed.name == state.kscreen_name {
+                        info!(
+                            "[kwin-virtual] virtual output device '{}' removed",
+                            removed.name
+                        );
+                    }
+                }
+                // Done concludes a coherent burst of device updates: after
+                // TX1's apply, KWin re-announces the injected custom mode
+                // before/around this event — the other half of the TX1→TX2
+                // trigger (the first half is the configuration's applied).
+                DeviceEvent::Done => {
+                    try_start_tx2(state, qh);
+                }
+                _ => {}
+            }
+        }
+
+        // The `mode` event (opcode 2) carries a new_id<kde_output_device_mode_v2>;
+        // wayland-client requires this specialization instead of panicking.
+        wayland_client::event_created_child!(State, KdeOutputDeviceV2, [
+            2 => (KdeOutputDeviceModeV2, ()),
+        ]);
+    }
+
+    impl Dispatch<KdeOutputDeviceModeV2, ()> for State {
+        fn event(
+            state: &mut Self,
+            mode: &KdeOutputDeviceModeV2,
+            event: DeviceModeEvent,
+            _: &(),
+            _: &Connection,
+            qh: &QueueHandle<Self>,
+        ) {
+            for d in &mut state.devices {
+                if let Some(m) = d.modes.iter_mut().find(|m| m.proxy.id() == mode.id()) {
+                    match event {
+                        DeviceModeEvent::Size { width, height } => {
+                            m.width = width;
+                            m.height = height;
+                        }
+                        DeviceModeEvent::Refresh { refresh } => m.refresh = refresh,
+                        // The mode becomes complete once KWin finishes
+                        // announcing it (its size event precedes done) —
+                        // try advancing a TX1 waiting on re-announcement.
+                        DeviceModeEvent::Preferred => {}
+                        DeviceModeEvent::Removed => m.removed = true,
+                        _ => {}
+                    }
+                    break;
+                }
+            }
+            // Mode objects carry no done event; a TX1 waiting on the
+            // re-announcement advances on the DEVICE's done instead.
+            let _ = qh;
+        }
+    }
+
+    impl Dispatch<KdeOutputConfigurationV2, ()> for State {
+        fn event(
+            state: &mut Self,
+            cfg: &KdeOutputConfigurationV2,
+            event: ConfigurationEvent,
+            _: &(),
+            _: &Connection,
+            qh: &QueueHandle<Self>,
+        ) {
+            let Some(txn) = state.mode_change.as_mut() else {
+                return;
+            };
+            if txn.cfg.id() != cfg.id() {
+                return;
+            }
+            match event {
+                ConfigurationEvent::Applied => {
+                    if matches!(txn.step, ModeChangeStep::Tx1CustomModes { .. }) {
+                        info!("[kwin-virtual] in-place mode change TX1: custom mode applied");
+                        txn.tx1_applied = true;
+                        if !try_start_tx2(state, qh) {
+                            // Mode object not re-announced yet; the
+                            // device's done event completes the trigger.
+                            info!(
+                                "[kwin-virtual] TX1 applied; awaiting mode re-announcement"
+                            );
+                        }
+                    } else {
+                        // TX2 applied: DONE. The output switched modes in
+                        // place — same output, same PipeWire node.
+                        let target = txn.target;
+                        if let Some(done) = state.mode_change.take() {
+                            if let ModeChangeStep::Tx2SetMode { modelist } = &done.step {
+                                modelist.destroy();
+                            }
+                            done.cfg.destroy();
+                            info!(
+                                "[kwin-virtual] in-place mode change applied: {}x{}",
+                                target.0, target.1
+                            );
+                            let _ = done.reply.send(ModeChangeOutcome::Applied);
+                        }
+                    }
+                }
+                ConfigurationEvent::Failed => {
+                    let reason = state
+                        .mode_change
+                        .as_ref()
+                        .and_then(|t| t.failure_reason.clone())
+                        .unwrap_or_else(|| "configuration rejected".to_string());
+                    warn!("[kwin-virtual] in-place mode change failed: {reason}");
+                    abort_mode_change(state, ModeChangeOutcome::Failed(reason));
+                }
+                // failure_reason (since 12) precedes `failed`; keep it.
+                _ => {
+                    let dbg = format!("{event:?}");
+                    if dbg.starts_with("FailureReason")
+                        && let Some(t) = state.mode_change.as_mut()
+                    {
+                        t.failure_reason = Some(dbg);
+                    }
+                }
+            }
+        }
+    }
+
+    impl Dispatch<KdeModeListV2, ()> for State {
+        fn event(
+            _: &mut Self,
+            _: &KdeModeListV2,
+            _: ModeListEvent,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            // kde_mode_list_v2 has no events.
+        }
+    }
+
     /// Consume a pending request's reply slot (if any) with an error, on a
     /// fatal thread condition (socket failure, dispatch failure). The
     /// proxy is dropped along with it — the thread is exiting.
@@ -533,7 +994,10 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>, config: VirtualOutpu
         if let Some((_, reply_slot)) = state.pending.take()
             && let Some(tx) = reply_slot
         {
-            let _ = tx.send(Err(msg));
+            let _ = tx.send(Err(msg.clone()));
+        }
+        if let Some(txn) = state.mode_change.take() {
+            let _ = txn.reply.send(ModeChangeOutcome::Failed(msg));
         }
     }
 
@@ -543,8 +1007,16 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>, config: VirtualOutpu
             error!("[kwin-virtual] cannot connect to Wayland: {e}");
             // Reply with errors until the channel drains, then exit.
             while let Ok(cmd) = rx.recv() {
-                if let WlCommand::CreateStream { reply, .. } = cmd {
-                    let _ = reply.send(Err(format!("wayland connection failed: {e}")));
+                match cmd {
+                    WlCommand::CreateStream { reply, .. } => {
+                        let _ = reply.send(Err(format!("wayland connection failed: {e}")));
+                    }
+                    WlCommand::ChangeMode { reply, .. } => {
+                        let _ = reply.send(ModeChangeOutcome::Failed(format!(
+                            "wayland connection failed: {e}"
+                        )));
+                    }
+                    WlCommand::Close => {}
                 }
             }
             return;
@@ -562,6 +1034,11 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>, config: VirtualOutpu
         retiring: None,
         closing: None,
         stream_sm: StreamRequestMachine::new(),
+        mgmt: None,
+        device_registry: None,
+        devices: Vec::new(),
+        mode_change: None,
+        kscreen_name: config.kscreen_name.clone(),
     };
 
     // Initial roundtrip: binds the zkde global (if advertised).
@@ -690,6 +1167,75 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>, config: VirtualOutpu
                         warn!("[kwin-virtual] flush failed: {e}");
                     }
                 }
+                Ok(WlCommand::ChangeMode {
+                    width,
+                    height,
+                    reply,
+                }) => {
+                    // Experiment D: TX1 (inject custom mode) → the
+                    // configuration's `applied` + the device's mode
+                    // re-announcement drive TX2 (set mode). Every guard
+                    // failure replies immediately with the outcome the
+                    // caller uses to select the recreate fallback.
+                    let mut reply = Some(reply);
+                    let immediate = 'guard: {
+                        if state.mode_change.is_some() {
+                            break 'guard Some(ModeChangeOutcome::Failed(
+                                "another mode change in flight".into(),
+                            ));
+                        }
+                        let Some((mgmt, mgmt_version)) =
+                            state.mgmt.as_ref().map(|(p, v)| (p.clone(), *v))
+                        else {
+                            break 'guard Some(ModeChangeOutcome::NotAdvertised);
+                        };
+                        if state.device_registry.is_none() {
+                            break 'guard Some(ModeChangeOutcome::NotAdvertised);
+                        }
+                        if mgmt_version < MGMT_V_CUSTOM_MODES {
+                            break 'guard Some(ModeChangeOutcome::Unsupported(
+                                "kde_output_management_v2 lacks set_custom_modes (bound < v18)",
+                            ));
+                        }
+                        let Some(device) = find_device(&mut state) else {
+                            break 'guard Some(ModeChangeOutcome::Unsupported(
+                                "virtual output device not discovered",
+                            ));
+                        };
+                        if device.capabilities & CAP_CUSTOM_MODES == 0 {
+                            break 'guard Some(ModeChangeOutcome::Unsupported(
+                                "device lacks the custom-modes capability",
+                            ));
+                        }
+                        let modelist = mgmt.create_mode_list(&qh, ());
+                        modelist.set_resolution(width as u32, height as u32);
+                        modelist.set_refresh_rate(60_000);
+                        modelist.add_mode();
+                        let cfg = mgmt.create_configuration(&qh, ());
+                        let dev = find_device(&mut state).unwrap();
+                        cfg.set_custom_modes(&dev.device, &modelist);
+                        cfg.apply();
+                        info!(
+                            "[kwin-virtual] in-place mode change TX1: inject custom mode {width}x{height}@60"
+                        );
+                        state.mode_change = Some(ModeChangeTxn {
+                            target: (width, height),
+                            reply: reply.take().unwrap(),
+                            cfg,
+                            step: ModeChangeStep::Tx1CustomModes { modelist },
+                            tx1_applied: false,
+                            failure_reason: None,
+                            deadline: std::time::Instant::now() + MODE_CHANGE_TIMEOUT,
+                        });
+                        if let Err(e) = conn.flush() {
+                            warn!("[kwin-virtual] flush failed: {e}");
+                        }
+                        None
+                    };
+                    if let Some(outcome) = immediate {
+                        let _ = reply.take().unwrap().send(outcome);
+                    }
+                }
                 Ok(WlCommand::Close) => {
                     // The ONLY place the stream is destroyed — this is
                     // what makes KWin remove the virtual output (the proxy
@@ -737,6 +1283,15 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>, config: VirtualOutpu
         if let Some(parked) = take_due_settle_close(&mut state.closing) {
             parked.close();
             info!("[kwin-virtual] settled — previous stream destroyed after swap");
+        }
+
+        // Expire a wedged in-place mode change: the caller's fallback
+        // (stream recreate) needs the prompt Timeout outcome.
+        if let Some(txn) = state.mode_change.as_ref()
+            && std::time::Instant::now() >= txn.deadline
+        {
+            warn!("[kwin-virtual] in-place mode change timed out");
+            abort_mode_change(&mut state, ModeChangeOutcome::Timeout);
         }
 
         // Always flush before the next poll iteration so requests reach

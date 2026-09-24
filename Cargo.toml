@@ -17,6 +17,12 @@ tracing = { version = "0.1", optional = true }
 anyhow = { version = "1", optional = true }
 wayland-client = { version = "0.31", optional = true }
 wayland-protocols-plasma = { version = "0.3", features = ["client"], optional = true }
+# Generates the vendored kde-output-management-v2/device-v2 bindings in
+# protocols.rs (the pinned plasma crate's XMLs predate custom modes).
+wayland-scanner = { version = "0.31", optional = true }
+# Referenced by the scanner-generated code paths.
+wayland-backend = { version = "0.3", optional = true }
+bitflags = { version = "2", optional = true }
 nix = { version = "0.31", features = ["poll"], optional = true }
 
 [features]
@@ -29,7 +35,7 @@ transport = ["dep:tokio", "dep:tracing"]
 # Spec-derived transparent pointer-shape PDU fields (MS-RDPBCGR).
 cursor = ["dep:tracing"]
 # KWin zkde-screencast virtual-output machinery (KDE Plasma 6+).
-kwin-virtual = ["dep:tokio", "dep:tracing", "dep:anyhow", "dep:wayland-client", "dep:wayland-protocols-plasma", "dep:nix"]
+kwin-virtual = ["dep:tokio", "dep:tracing", "dep:anyhow", "dep:wayland-client", "dep:wayland-protocols-plasma", "dep:wayland-scanner", "dep:wayland-backend", "dep:bitflags", "dep:nix"]
 
 [dev-dependencies]
 # Tests use tokio's paused-clock facilities and duplex streams.
