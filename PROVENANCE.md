@@ -88,3 +88,13 @@ generic `S: AsyncRead + AsyncWrite + Unpin` instead of the fork's
    shared algorithm is needed, write a fresh implementation and note it
    here (the `merge_regions` precedent).
 3. Keep this file current with every module change.
+
+## `src/clipboard.rs` — staged file-paste tree + pending-paste matcher
+
+| | |
+|---|---|
+| Fork source | None verbatim. **Written fresh for this crate** (campaign 3 of the VMCreate distro tests, 2026-10-25) to fix two fork defects found in host→guest file paste on GNOME: a copied directory staged as flat leaf-named 0-byte files (`sanitize_filename_for_linux(&name)` dropped the descriptor's relative directory), a copied directory offered guest→host without its contents (the fork listed only the top-level paths), and a paste never answered once the protocol layer began delivering the file list as its own event (`take_pending_file_paste`, first drafted inline in the fork's `rdp_ingress.rs` during the same campaign, moved here before review) |
+| Purpose | Expand copied local paths (guest→host) into a parents-first entry list, so a copied directory is not offered empty; turn a FileGroupDescriptorW listing into a sanitized relative tree (directories inferred from descendants when the attribute is not carried; `..`/absolute/`/` neutralised per component; top-level flag so only the copied items are announced); pick the pending local paste request a remote file list answers |
+| Upstream-absence searches | Not applicable — no fork or upstream text was the starting point. The fork's existing sanitizer (`lamco-clipboard-core::sanitize_filename_for_linux`, MIT OR Apache-2.0) was deliberately not copied; `sanitize_component` is a separate, smaller rule set |
+| Re-typing | Crate-local `RemoteEntry` / `StagedEntry`; the matcher is generic over the request's extra payload instead of the fork's `(u32, String, Instant)` tuple, and takes the prefetch sentinel as a parameter |
+| Dependencies | std only |

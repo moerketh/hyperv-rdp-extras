@@ -32,6 +32,9 @@ default = ["geometry", "transport"]
 geometry = []
 # AsyncRdpStream-agnostic first-byte deadline wrapper around any tokio stream.
 transport = ["dep:tokio", "dep:tracing"]
+# Host→guest file-paste helpers: FileGroupDescriptorW tree planning and the
+# pending paste-request matcher. Pure std — no dependencies.
+clipboard = []
 # Spec-derived transparent pointer-shape PDU fields (MS-RDPBCGR).
 cursor = ["dep:tracing"]
 # KWin zkde-screencast virtual-output machinery (KDE Plasma 6+).

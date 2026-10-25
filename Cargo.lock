@@ -69,11 +69,14 @@ name = "hyperv-rdp-extras"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bitflags",
  "nix",
  "tokio",
  "tracing",
+ "wayland-backend",
  "wayland-client",
  "wayland-protocols-plasma",
+ "wayland-scanner",
 ]
 
 [[package]]
