@@ -13,6 +13,8 @@
 //!   copied directory arrives with its contents rather than empty.
 //! - [`take_pending_file_paste`] picks the local paste request that a
 //!   remote file list answers out of a FIFO of pending clipboard requests.
+//! - [`FormatListDedup`] drops the duplicate Format List a single host copy
+//!   can arrive as, so the copy is handled once.
 //!
 //! Windows lists a copied directory as its own descriptor
 //! (`FILE_ATTRIBUTE_DIRECTORY`, size 0) followed by its contents, each
@@ -27,6 +29,7 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 /// Linux `NAME_MAX`: the longest path component, in bytes.
 pub const MAX_COMPONENT_BYTES: usize = 255;
@@ -254,9 +257,114 @@ pub fn take_pending_file_paste<T>(
         .and_then(|i| pending.remove(i))
 }
 
+/// Drops a remote Format List that repeats the previous one within a short
+/// window.
+///
+/// One copy on the Windows host can reach the server as two identical
+/// Format List PDUs microseconds apart (Explorer updates the clipboard
+/// twice for a single copy, and vmconnect forwards each update). Handling
+/// both takes local selection ownership twice, so every local paste source
+/// fetches the FileGroupDescriptorW twice concurrently; vmconnect then fails
+/// one of the requests and the paste breaks. A list equal to the previous
+/// one (same format ids and names, same order) that arrives within the
+/// window is that echo, not a new copy.
+///
+/// The window restarts on every list, admitted or not, so a burst of echoes
+/// collapses into the first. Call [`FormatListDedup::reset`] when the
+/// session ends.
+#[derive(Debug)]
+pub struct FormatListDedup {
+    window: Duration,
+    last: Option<(FormatList, Instant)>,
+}
+
+/// `(format id, name)` pairs in wire order.
+type FormatList = Vec<(u32, Option<String>)>;
+
+impl FormatListDedup {
+    /// Observed echoes arrive within ~0.1 ms; a person cannot copy twice in
+    /// 250 ms.
+    pub const DEFAULT_WINDOW: Duration = Duration::from_millis(250);
+
+    pub fn new(window: Duration) -> Self {
+        Self { window, last: None }
+    }
+
+    /// `true` to handle this Format List, `false` when it repeats the
+    /// previous one within the window. `formats` is `(format id, name)`.
+    pub fn admit<'a>(
+        &mut self,
+        formats: impl IntoIterator<Item = (u32, Option<&'a str>)>,
+        now: Instant,
+    ) -> bool {
+        let list: FormatList = formats
+            .into_iter()
+            .map(|(id, name)| (id, name.map(str::to_owned)))
+            .collect();
+        let echo = matches!(&self.last, Some((prev, at))
+            if *prev == list && now.saturating_duration_since(*at) <= self.window);
+        self.last = Some((list, now));
+        !echo
+    }
+
+    /// Forget the previous list (session end).
+    pub fn reset(&mut self) {
+        self.last = None;
+    }
+}
+
+impl Default for FormatListDedup {
+    fn default() -> Self {
+        Self::new(Self::DEFAULT_WINDOW)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const FILES: [(u32, Option<&str>); 3] = [
+        (49386, Some("FileGroupDescriptorW")),
+        (49385, Some("FileContents")),
+        (49384, Some("Preferred DropEffect")),
+    ];
+    const TEXT: [(u32, Option<&str>); 2] = [(13, None), (1, None)];
+
+    #[test]
+    fn format_list_echo_within_window_is_dropped() {
+        let mut d = FormatListDedup::default();
+        let t0 = Instant::now();
+        assert!(d.admit(FILES, t0));
+        assert!(!d.admit(FILES, t0 + Duration::from_micros(50)));
+        // A burst keeps collapsing: the window restarts on every list.
+        assert!(!d.admit(FILES, t0 + Duration::from_millis(200)));
+        assert!(!d.admit(FILES, t0 + Duration::from_millis(400)));
+    }
+
+    #[test]
+    fn format_list_repeat_after_window_or_changed_is_admitted() {
+        let mut d = FormatListDedup::default();
+        let t0 = Instant::now();
+        assert!(d.admit(FILES, t0));
+        assert!(d.admit(FILES, t0 + Duration::from_secs(1)), "a later copy of the same kind");
+        assert!(d.admit(TEXT, t0 + Duration::from_millis(1001)), "different formats");
+        assert!(
+            d.admit(FILES, t0 + Duration::from_millis(1002)),
+            "differs from the previous list, not from an older one"
+        );
+        let mut renamed = FILES;
+        renamed[2].1 = Some("Shell IDList Array");
+        assert!(d.admit(renamed, t0 + Duration::from_millis(1003)), "same ids, other names");
+    }
+
+    #[test]
+    fn format_list_reset_forgets_the_previous_list() {
+        let mut d = FormatListDedup::default();
+        let t0 = Instant::now();
+        assert!(d.admit(FILES, t0));
+        d.reset();
+        assert!(d.admit(FILES, t0), "a new session's first list is never an echo");
+    }
 
     fn entry<'a>(dir: Option<&'a str>, name: &'a str) -> RemoteEntry<'a> {
         RemoteEntry {
