@@ -15,6 +15,8 @@
 //!   remote file list answers out of a FIFO of pending clipboard requests.
 //! - [`FormatListDedup`] drops the duplicate Format List a single host copy
 //!   can arrive as, so the copy is handled once.
+//! - [`EarlyRequestRetry`] paces re-requests of clipboard data (a file list,
+//!   eagerly fetched text) the client failed right after announcing it.
 //!
 //! Windows lists a copied directory as its own descriptor
 //! (`FILE_ATTRIBUTE_DIRECTORY`, size 0) followed by its contents, each
@@ -105,7 +107,11 @@ pub fn plan_staged_tree(entries: &[RemoteEntry<'_>]) -> Vec<StagedEntry> {
         .iter()
         .map(|e| {
             let c = components(e);
-            if c.is_empty() { vec!["_".to_string()] } else { c }
+            if c.is_empty() {
+                vec!["_".to_string()]
+            } else {
+                c
+            }
         })
         .collect();
 
@@ -319,6 +325,49 @@ impl Default for FormatListDedup {
     }
 }
 
+/// Backoff for re-requesting clipboard data (a FileGroupDescriptorW file
+/// list, an eagerly fetched text format) that the client answered with a
+/// failure.
+///
+/// vmconnect can fail a Format Data Request sent within a millisecond of its
+/// own Format List — Explorer's clipboard is still being filled — and a
+/// moment later the same request succeeds. Servers that fetch eagerly on the
+/// Format List hit this every few copies; without a retry the local paste
+/// fails for good. The budget restarts with every Format List (a new copy);
+/// past it the failure is real and should reach the paste.
+#[derive(Debug, Default)]
+pub struct EarlyRequestRetry {
+    attempts: usize,
+}
+
+impl EarlyRequestRetry {
+    /// Delays before the 1st, 2nd and 3rd re-request.
+    pub const BACKOFF: [Duration; 3] = [
+        Duration::from_millis(100),
+        Duration::from_millis(250),
+        Duration::from_millis(500),
+    ];
+
+    pub const fn new() -> Self {
+        Self { attempts: 0 }
+    }
+
+    /// A new Format List arrived: the next failure gets the full budget.
+    pub fn reset(&mut self) {
+        self.attempts = 0;
+    }
+
+    /// How long to wait before re-requesting after a failure, or `None` once
+    /// the budget is spent.
+    pub fn next_delay(&mut self) -> Option<Duration> {
+        let delay = Self::BACKOFF.get(self.attempts).copied();
+        if delay.is_some() {
+            self.attempts += 1;
+        }
+        delay
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,15 +395,40 @@ mod tests {
         let mut d = FormatListDedup::default();
         let t0 = Instant::now();
         assert!(d.admit(FILES, t0));
-        assert!(d.admit(FILES, t0 + Duration::from_secs(1)), "a later copy of the same kind");
-        assert!(d.admit(TEXT, t0 + Duration::from_millis(1001)), "different formats");
+        assert!(
+            d.admit(FILES, t0 + Duration::from_secs(1)),
+            "a later copy of the same kind"
+        );
+        assert!(
+            d.admit(TEXT, t0 + Duration::from_millis(1001)),
+            "different formats"
+        );
         assert!(
             d.admit(FILES, t0 + Duration::from_millis(1002)),
             "differs from the previous list, not from an older one"
         );
         let mut renamed = FILES;
         renamed[2].1 = Some("Shell IDList Array");
-        assert!(d.admit(renamed, t0 + Duration::from_millis(1003)), "same ids, other names");
+        assert!(
+            d.admit(renamed, t0 + Duration::from_millis(1003)),
+            "same ids, other names"
+        );
+    }
+
+    #[test]
+    fn early_request_retry_backs_off_then_gives_up_until_reset() {
+        let mut r = EarlyRequestRetry::new();
+        assert_eq!(r.next_delay(), Some(Duration::from_millis(100)));
+        assert_eq!(r.next_delay(), Some(Duration::from_millis(250)));
+        assert_eq!(r.next_delay(), Some(Duration::from_millis(500)));
+        assert_eq!(r.next_delay(), None, "budget spent: the failure is real");
+        assert_eq!(r.next_delay(), None);
+        r.reset();
+        assert_eq!(
+            r.next_delay(),
+            Some(Duration::from_millis(100)),
+            "a new copy gets a new budget"
+        );
     }
 
     #[test]
@@ -363,7 +437,10 @@ mod tests {
         let t0 = Instant::now();
         assert!(d.admit(FILES, t0));
         d.reset();
-        assert!(d.admit(FILES, t0), "a new session's first list is never an echo");
+        assert!(
+            d.admit(FILES, t0),
+            "a new session's first list is never an echo"
+        );
     }
 
     fn entry<'a>(dir: Option<&'a str>, name: &'a str) -> RemoteEntry<'a> {
@@ -409,7 +486,10 @@ mod tests {
             },
             entry(None, "a\\b.txt"),
         ]);
-        assert!(plan[0].is_directory, "explicit attribute wins over inference");
+        assert!(
+            plan[0].is_directory,
+            "explicit attribute wins over inference"
+        );
         assert_eq!(plan[1].path, PathBuf::from("a/b.txt"));
         assert!(!plan[1].top_level);
     }
@@ -445,7 +525,10 @@ mod tests {
             (3, "text/uri-list".to_string(), ()),
         ]);
         let got = take_pending_file_paste(&mut pending, u32::MAX);
-        assert_eq!(got.map(|(s, m, _)| (s, m)), Some((2, "x-special/gnome-copied-files".to_string())));
+        assert_eq!(
+            got.map(|(s, m, _)| (s, m)),
+            Some((2, "x-special/gnome-copied-files".to_string()))
+        );
         assert_eq!(pending.len(), 3, "only the answered request is removed");
         assert_eq!(pending[1].0, 1, "the text request keeps its place");
     }
@@ -470,11 +553,17 @@ mod tests {
     #[test]
     fn expand_outgoing_walks_directories_parents_first() {
         let base = temp_tree();
-        let (entries, skipped) =
-            expand_outgoing(&[base.join("g.bin"), base.join("gdir x")], 1000);
+        let (entries, skipped) = expand_outgoing(&[base.join("g.bin"), base.join("gdir x")], 1000);
         let got: Vec<_> = entries
             .iter()
-            .map(|e| (e.relative_dir.as_deref(), e.name.as_str(), e.is_directory, e.size))
+            .map(|e| {
+                (
+                    e.relative_dir.as_deref(),
+                    e.name.as_str(),
+                    e.is_directory,
+                    e.size,
+                )
+            })
             .collect();
         assert_eq!(
             got,
@@ -495,10 +584,13 @@ mod tests {
     #[test]
     fn expand_outgoing_caps_entries_and_skips_missing_roots() {
         let base = temp_tree();
-        let (entries, skipped) =
-            expand_outgoing(&[base.join("missing"), base.join("gdir x")], 2);
+        let (entries, skipped) = expand_outgoing(&[base.join("missing"), base.join("gdir x")], 2);
         assert_eq!(entries.len(), 2);
-        assert_eq!(skipped, 1 + 2, "missing root + two entries past the cap (sub/ is never entered)");
+        assert_eq!(
+            skipped,
+            1 + 2,
+            "missing root + two entries past the cap (sub/ is never entered)"
+        );
         std::fs::remove_dir_all(base).unwrap();
     }
 
@@ -509,8 +601,14 @@ mod tests {
         std::fs::create_dir_all(&deep).unwrap();
         std::fs::write(deep.join("f.txt"), b"f").unwrap();
         let (entries, skipped) = expand_outgoing(&[base.join("gdir x")], 1000);
-        assert!(entries.iter().any(|e| e.name.len() == 250), "250 + 7 units fits");
-        assert!(entries.iter().all(|e| e.name != "f.txt"), "257 + 6 units does not");
+        assert!(
+            entries.iter().any(|e| e.name.len() == 250),
+            "250 + 7 units fits"
+        );
+        assert!(
+            entries.iter().all(|e| e.name != "f.txt"),
+            "257 + 6 units does not"
+        );
         assert_eq!(skipped, 1);
         std::fs::remove_dir_all(base).unwrap();
     }
