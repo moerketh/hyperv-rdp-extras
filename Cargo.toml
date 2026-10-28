@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT"
-description = "Standalone modules from the moerketh lamco-rdp-server Hyper-V fork: transport handshake deadline, damage-region geometry, and KWin virtual-output session machinery."
+description = "Standalone modules from the moerketh lamco-rdp-server Hyper-V fork: transport handshake deadline, damage-region geometry, KWin virtual-output session machinery, and MS-RDPECLIP clipboard/file-paste helpers."
 repository = "https://github.com/moerketh/hyperv-rdp-extras"
 keywords = ["rdp", "hyper-v", "wayland", "damage-tracking", "async"]
 categories = ["multimedia::video", "network-programming", "os::linux-apis"]
@@ -32,8 +32,10 @@ default = ["geometry", "transport"]
 geometry = []
 # AsyncRdpStream-agnostic first-byte deadline wrapper around any tokio stream.
 transport = ["dep:tokio", "dep:tracing"]
-# Host→guest file-paste helpers: FileGroupDescriptorW tree planning and the
-# pending paste-request matcher. Pure std — no dependencies.
+# Clipboard MS-RDPECLIP helpers + file-paste planning: Format List dedup,
+# paced re-requests of early client failures, staged-tree planning, the
+# outgoing walk, and the pending paste-request matcher. Pure std — no
+# dependencies.
 clipboard = []
 # Spec-derived transparent pointer-shape PDU fields (MS-RDPBCGR).
 cursor = ["dep:tracing"]

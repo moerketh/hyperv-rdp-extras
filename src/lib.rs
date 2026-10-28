@@ -17,12 +17,13 @@
 //!   sends a first byte within a deadline, so a silent client cannot park a
 //!   serial accept loop and black out every listener. Generic over any
 //!   tokio `AsyncRead + AsyncWrite` stream.
-//! - [`clipboard`] — host→guest file-paste helpers: a FileGroupDescriptorW
-//!   listing planned into a sanitized relative tree (directories kept,
-//!   top-level entries flagged for the URI list), the reverse walk that
-//!   expands a copied local directory into its entries, and the pending-request
-//!   matcher that pairs a remote file list with the local paste it answers.
-//!   Pure `std`.
+//! - [`clipboard`] — MS-RDPECLIP helpers: Format List deduplication and
+//!   paced re-requests of early client failures, host→guest file-paste
+//!   planning (a FileGroupDescriptorW listing planned into a sanitized
+//!   relative tree, top-level entries flagged for the URI list), the
+//!   guest→host walk that expands a copied local directory into its
+//!   entries, and the pending-request matcher that pairs a remote file
+//!   list with the local paste it answers. Pure `std`.
 //! - [`cursor`] — spec-derived transparent pointer-shape fields
 //!   (MS-RDPBCGR TS_COLORPOINTERATTRIBUTE) plus a re-send cadence counter,
 //!   for taking pointer ownership on clients that ignore `HidePointer`.

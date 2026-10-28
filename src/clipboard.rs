@@ -1,6 +1,13 @@
-//! Host→guest file-paste helpers for an RDP clipboard (MS-RDPECLIP) server
-//! that stages Windows files into a local directory.
+//! Clipboard-server helpers around the MS-RDPECLIP Format List / Format
+//! Data Request exchange, plus the file-paste planning on top of it.
 //!
+//! - [`FormatListDedup`] drops the duplicate Format List a single host copy
+//!   can arrive as, so the copy is handled once.
+//! - [`EarlyRequestRetry`] paces re-requests of clipboard data (a file
+//!   list, eagerly fetched text) the client failed right after announcing
+//!   it.
+//! - [`take_pending_file_paste`] picks the local paste request that a
+//!   remote file list answers out of a FIFO of pending clipboard requests.
 //! - [`plan_staged_tree`] turns a FileGroupDescriptorW listing into a safe
 //!   relative tree: every entry gets a sanitized relative path (no `..`,
 //!   no absolute paths, no `/` smuggled inside a component), a
@@ -11,12 +18,6 @@
 //! - [`expand_outgoing`] is the guest→host direction: copied local paths
 //!   expanded into the parents-first entry list an offer needs, so a
 //!   copied directory arrives with its contents rather than empty.
-//! - [`take_pending_file_paste`] picks the local paste request that a
-//!   remote file list answers out of a FIFO of pending clipboard requests.
-//! - [`FormatListDedup`] drops the duplicate Format List a single host copy
-//!   can arrive as, so the copy is handled once.
-//! - [`EarlyRequestRetry`] paces re-requests of clipboard data (a file list,
-//!   eagerly fetched text) the client failed right after announcing it.
 //!
 //! Windows lists a copied directory as its own descriptor
 //! (`FILE_ATTRIBUTE_DIRECTORY`, size 0) followed by its contents, each
@@ -29,7 +30,7 @@
 //!
 //! Pure `std`.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -37,7 +38,9 @@ use std::time::{Duration, Instant};
 pub const MAX_COMPONENT_BYTES: usize = 255;
 
 /// MIME types under which a local application asks for a file paste.
-pub const FILE_PASTE_MIMES: [&str; 2] = ["text/uri-list", "x-special/gnome-copied-files"];
+/// Adding a type is not a breaking change for callers that iterate the
+/// slice; matching a fixed set of variants against it is.
+pub const FILE_PASTE_MIMES: &[&str] = &["text/uri-list", "x-special/gnome-copied-files"];
 
 /// One FileGroupDescriptorW entry as a decoder reports it.
 #[derive(Debug, Clone, Copy)]
@@ -48,7 +51,10 @@ pub struct RemoteEntry<'a> {
     /// Entry name. A leaf, or a full `\`-separated path for decoders that
     /// do not split it.
     pub name: &'a str,
-    /// `FILE_ATTRIBUTE_DIRECTORY`, when the decoder kept the attributes.
+    /// `FILE_ATTRIBUTE_DIRECTORY` (`0x10`), when the decoder kept the
+    /// attributes; `None` when it did not, in which case
+    /// [`plan_staged_tree`] infers the verdict from descendants. `Some(_)`
+    /// always wins over inference, including `Some(false)` for a leaf.
     pub is_directory: Option<bool>,
 }
 
@@ -102,6 +108,13 @@ fn components(entry: &RemoteEntry<'_>) -> Vec<String> {
 /// Plan the local tree for a remote file list. The result has one
 /// [`StagedEntry`] per input entry, in input order (so list indices for
 /// file-contents requests carry over unchanged).
+///
+/// Distinct entries can sanitize to the same path (`.`, `..` and empty
+/// names all become `_`); the duplicate lands on top of the first. A
+/// caller that stages entries in order keeps the first version. An entry
+/// whose path equals a prefix of another's path keeps its explicit
+/// file-or-directory verdict when it has one; inference declares the
+/// shorter one a directory.
 pub fn plan_staged_tree(entries: &[RemoteEntry<'_>]) -> Vec<StagedEntry> {
     let paths: Vec<Vec<String>> = entries
         .iter()
@@ -115,15 +128,20 @@ pub fn plan_staged_tree(entries: &[RemoteEntry<'_>]) -> Vec<StagedEntry> {
         })
         .collect();
 
+    // Parent prefixes of every path, so a directory can be inferred
+    // without comparing every entry against every other.
+    let mut parents: HashSet<Vec<String>> = HashSet::new();
+    for path in &paths {
+        for i in 1..path.len() {
+            parents.insert(path[..i].to_vec());
+        }
+    }
+
     entries
         .iter()
         .zip(&paths)
         .map(|(entry, path)| {
-            let is_directory = entry.is_directory.unwrap_or_else(|| {
-                paths
-                    .iter()
-                    .any(|other| other.len() > path.len() && other.starts_with(path))
-            });
+            let is_directory = entry.is_directory.unwrap_or(parents.contains(path));
             StagedEntry {
                 path: path.iter().collect(),
                 is_directory,
@@ -133,8 +151,9 @@ pub fn plan_staged_tree(entries: &[RemoteEntry<'_>]) -> Vec<StagedEntry> {
         .collect()
 }
 
-/// Longest FileGroupDescriptorW `cFileName` (`relative_dir\name`), in UTF-16
-/// code units, leaving room for the terminator in the 260-unit field.
+/// Longest FileGroupDescriptorW `cFileName` field (the
+/// `relative_dir\name` it carries), in UTF-16 code units, leaving room for
+/// the NUL terminator in its 260-unit field (`MAX_PATH`).
 pub const MAX_WIRE_NAME_UNITS: usize = 259;
 
 /// One local entry to offer in a FileGroupDescriptorW list.
@@ -152,15 +171,40 @@ pub struct OutgoingEntry {
     pub size: u64,
 }
 
+/// Windows rejects these in file names (Win32 path naming); a component
+/// carrying one cannot be created on the host.
+const WINDOWS_INVALID_CHARS: [char; 9] = ['\\', '/', ':', '*', '?', '"', '<', '>', '|'];
+
+/// True when a path component is a name Windows accepts: no [`WINDOWS_INVALID_CHARS`],
+/// no control characters, and no trailing dot or space (Win32 strips those
+/// and then rejects the empty remainder).
+fn windows_safe_component(name: &str) -> bool {
+    !name.is_empty()
+        && !name
+            .chars()
+            .any(|c| WINDOWS_INVALID_CHARS.contains(&c) || c.is_control() || c == '\0')
+        && !name.ends_with('.')
+        && !name.ends_with(' ')
+        && name != "."
+        && name != ".."
+}
+
 /// Expand copied local paths into the flat list a FileGroupDescriptorW offer
 /// needs: each copied item, and for a copied directory everything beneath
 /// it, parents before children (Windows creates entries in list order).
 /// Offering only the directory itself makes the receiver create it empty.
 ///
-/// Symlinked directories below a root are skipped (loop safety); symlinked
-/// files are offered with their target's contents. Unreadable entries,
-/// entries whose wire name would exceed [`MAX_WIRE_NAME_UNITS`], and
-/// anything past `max_entries` are skipped; the second value counts them.
+/// The guest is the less-trusted side here: a component Windows cannot
+/// create (see [`windows_safe_component`]) skips that entry, and — because
+/// its children could not be created on the host either — the subtree
+/// under it, both counted in `skipped`. Special files (FIFOs, sockets,
+/// devices) are skipped rather than offered as 0-byte files: serving their
+/// contents would block the server. Symlinked directories below a root
+/// are skipped (loop safety); symlinked files are offered with their
+/// target's contents. Unreadable entries, entries whose wire name would
+/// exceed [`MAX_WIRE_NAME_UNITS`], and anything past `max_entries` are
+/// skipped; the second value counts every skipped entry, including the
+/// contents of a skipped directory.
 pub fn expand_outgoing(roots: &[PathBuf], max_entries: usize) -> (Vec<OutgoingEntry>, usize) {
     let mut out = Vec::new();
     let mut skipped = 0;
@@ -178,6 +222,25 @@ pub fn expand_outgoing(roots: &[PathBuf], max_entries: usize) -> (Vec<OutgoingEn
     (out, skipped)
 }
 
+/// Count the entries a skipped subtree would have contributed: the entry
+/// itself plus everything readable under it. Symlinks count as one entry
+/// and are not followed (loop safety).
+fn count_tree(path: &std::path::Path) -> usize {
+    let Ok(link_meta) = std::fs::symlink_metadata(path) else {
+        return 1;
+    };
+    if link_meta.file_type().is_symlink() || !link_meta.is_dir() {
+        return 1;
+    }
+    let Ok(read_dir) = std::fs::read_dir(path) else {
+        return 1;
+    };
+    1 + read_dir
+        .filter_map(|e| e.ok())
+        .map(|e| count_tree(&e.path()))
+        .sum::<usize>()
+}
+
 fn walk(
     path: &std::path::Path,
     relative_dir: Option<String>,
@@ -187,13 +250,23 @@ fn walk(
     out: &mut Vec<OutgoingEntry>,
     skipped: &mut usize,
 ) {
+    // Serving a special file's contents can block forever; a 0-byte file
+    // in its place corrupts the tree.
+    if !meta.is_file() && !meta.is_dir() {
+        *skipped += 1;
+        return;
+    }
     let wire_units = relative_dir
         .as_deref()
         .map_or(0, |d| d.encode_utf16().count() + 1)
         + name.encode_utf16().count();
-    if name.is_empty() || wire_units > MAX_WIRE_NAME_UNITS || out.len() >= max_entries {
-        // A directory's contents go with it: their wire names only grow.
-        *skipped += 1;
+    if !windows_safe_component(&name)
+        || wire_units > MAX_WIRE_NAME_UNITS
+        || out.len() >= max_entries
+    {
+        // Their children cannot be created on the host either: count the
+        // whole subtree, then stop.
+        *skipped += count_tree(path);
         return;
     }
     let is_directory = meta.is_dir();
@@ -275,9 +348,16 @@ pub fn take_pending_file_paste<T>(
 /// one (same format ids and names, same order) that arrives within the
 /// window is that echo, not a new copy.
 ///
+/// On `false` (an echo), skip taking the local selection and fetching data,
+/// but still answer the PDU per MS-RDPECLIP (send the Format List Response
+/// and lock/relock as usual) — dropping the message entirely violates the
+/// protocol.
+///
 /// The window restarts on every list, admitted or not, so a burst of echoes
 /// collapses into the first. Call [`FormatListDedup::reset`] when the
-/// session ends.
+/// server announces **its own** Format List (a guest copy between two host
+/// copies would otherwise make the second host copy look like an echo of
+/// the first) and when the session ends.
 #[derive(Debug)]
 pub struct FormatListDedup {
     window: Duration,
@@ -292,12 +372,15 @@ impl FormatListDedup {
     /// 250 ms.
     pub const DEFAULT_WINDOW: Duration = Duration::from_millis(250);
 
-    pub fn new(window: Duration) -> Self {
+    pub const fn new(window: Duration) -> Self {
         Self { window, last: None }
     }
 
-    /// `true` to handle this Format List, `false` when it repeats the
-    /// previous one within the window. `formats` is `(format id, name)`.
+    /// `true` to handle this Format List (take the selection, fetch data),
+    /// `false` when it repeats the previous one within the window — answer
+    /// the PDU, but do not handle the copy a second time. `formats` is
+    /// `(format id, name)`.
+    #[must_use = "ignoring the verdict double-handles the copy or drops a protocol response"]
     pub fn admit<'a>(
         &mut self,
         formats: impl IntoIterator<Item = (u32, Option<&'a str>)>,
@@ -313,7 +396,8 @@ impl FormatListDedup {
         !echo
     }
 
-    /// Forget the previous list (session end).
+    /// Forget the previous list (the server announced its own, or the
+    /// session ended).
     pub fn reset(&mut self) {
         self.last = None;
     }
@@ -327,14 +411,20 @@ impl Default for FormatListDedup {
 
 /// Backoff for re-requesting clipboard data (a FileGroupDescriptorW file
 /// list, an eagerly fetched text format) that the client answered with a
-/// failure.
+/// failure *soon after announcing it* — vmconnect can fail a Format Data
+/// Request sent within a millisecond of its own Format List (Explorer's
+/// clipboard is still being filled) and answer the same request a moment
+/// later. A genuine failure (minutes into a paste) falls through with the
+/// first call: the caller checks the failure against the Format List's
+/// arrival time before consulting this, so the budget is only spent on
+/// early failures.
 ///
-/// vmconnect can fail a Format Data Request sent within a millisecond of its
-/// own Format List — Explorer's clipboard is still being filled — and a
-/// moment later the same request succeeds. Servers that fetch eagerly on the
-/// Format List hit this every few copies; without a retry the local paste
-/// fails for good. The budget restarts with every Format List (a new copy);
-/// past it the failure is real and should reach the paste.
+/// The budget is shared by every format fetched for one copy (a file list
+/// and a text format together). [`EarlyRequestRetry::reset`] restarts it —
+/// call it on every Format List the caller *handles* (not echoes dropped
+/// by [`FormatListDedup`], which repeat the same copy). A retry still
+/// waiting when a new copy arrives must be cancelled by the caller, or it
+/// requests the new copy's data for the old paste.
 #[derive(Debug, Default)]
 pub struct EarlyRequestRetry {
     attempts: usize,
@@ -348,17 +438,24 @@ impl EarlyRequestRetry {
         Duration::from_millis(500),
     ];
 
+    /// How soon after the announcing Format List a failure still counts as
+    /// early.
+    pub const WINDOW: Duration = Duration::from_secs(2);
+
     pub const fn new() -> Self {
         Self { attempts: 0 }
     }
 
-    /// A new Format List arrived: the next failure gets the full budget.
+    /// A handled Format List arrived: the next failure gets the full
+    /// budget.
     pub fn reset(&mut self) {
         self.attempts = 0;
     }
 
     /// How long to wait before re-requesting after a failure, or `None` once
-    /// the budget is spent.
+    /// the budget is spent — the failure is real and should reach the
+    /// paste.
+    #[must_use = "ignoring `None` silently retries; ignoring a delay wastes the budget"]
     pub fn next_delay(&mut self) -> Option<Duration> {
         let delay = Self::BACKOFF.get(self.attempts).copied();
         if delay.is_some() {
@@ -587,9 +684,8 @@ mod tests {
         let (entries, skipped) = expand_outgoing(&[base.join("missing"), base.join("gdir x")], 2);
         assert_eq!(entries.len(), 2);
         assert_eq!(
-            skipped,
-            1 + 2,
-            "missing root + two entries past the cap (sub/ is never entered)"
+            skipped, 4,
+            "missing root + every entry past the cap: empty/ (1) and sub/ + inner.txt (2)"
         );
         std::fs::remove_dir_all(base).unwrap();
     }
@@ -609,7 +705,7 @@ mod tests {
             entries.iter().all(|e| e.name != "f.txt"),
             "257 + 6 units does not"
         );
-        assert_eq!(skipped, 1);
+        assert_eq!(skipped, 1, "only the file under the still-fitting dir");
         std::fs::remove_dir_all(base).unwrap();
     }
 
@@ -619,5 +715,64 @@ mod tests {
             VecDeque::from(vec![(1, "text/plain".to_string(), ())]);
         assert!(take_pending_file_paste(&mut pending, u32::MAX).is_none());
         assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn expand_outgoing_skips_windows_uncreatable_names_and_their_subtrees() {
+        let base = temp_tree();
+        let bad = base.join("bad:dir");
+        std::fs::create_dir_all(bad.join("nested")).unwrap();
+        std::fs::write(bad.join("nested/f.txt"), b"f").unwrap();
+        std::fs::write(base.join("trail. "), b"t").unwrap();
+        let (entries, skipped) =
+            expand_outgoing(&[base.join("g.bin"), bad, base.join("trail. ")], 1000);
+        assert_eq!(
+            entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            vec!["g.bin"],
+            "the uncreatable names and everything under them are not offered"
+        );
+        assert_eq!(
+            skipped, 4,
+            "bad:dir + nested + f.txt + 'trail. ' all counted"
+        );
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn expand_outgoing_skips_special_files() {
+        let base = temp_tree();
+        let fifo = base.join("pipe");
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        let (entries, skipped) = expand_outgoing(&[base.join("g.bin"), fifo], 1000);
+        assert_eq!(
+            entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            vec!["g.bin"],
+            "a FIFO is not offered as a file its contents would block on"
+        );
+        assert_eq!(skipped, 1);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn plan_staged_tree_marks_dot_as_a_directory_when_nested() {
+        let plan = plan_staged_tree(&[entry(None, "."), entry(Some("."), "keep.txt")]);
+        assert!(plan[0].is_directory, "'_' has an entry beneath it");
+        assert_eq!(plan[1].path, PathBuf::from("_/keep.txt"));
+    }
+
+    #[test]
+    fn format_list_reset_after_a_guest_copy_admits_the_repeat() {
+        let mut d = FormatListDedup::default();
+        let t0 = Instant::now();
+        assert!(d.admit(FILES, t0));
+        // The guest copies in between: the server announced its own list.
+        d.reset();
+        assert!(
+            d.admit(FILES, t0 + Duration::from_millis(100)),
+            "the host's second copy is not an echo of its first"
+        );
     }
 }

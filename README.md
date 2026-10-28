@@ -25,6 +25,20 @@ See [PROVENANCE.md](PROVENANCE.md) for the per-module audit trail.
   serial accept loop and blacking out every listener. Transport-agnostic:
   TCP, AF_VSOCK, Unix, TLS, WebSocket.
 
+### `clipboard` — MS-RDPECLIP helpers + file-paste planning (opt-in)
+
+- [`FormatListDedup`](src/clipboard.rs) — drops the duplicate Format List
+  a single Windows copy can arrive as, so the copy is handled once
+- [`EarlyRequestRetry`](src/clipboard.rs) — paced re-requests of
+  clipboard data the client failed right after announcing it (vmconnect
+  refuses requests that race its own Format List)
+- [`plan_staged_tree`](src/clipboard.rs) / [`expand_outgoing`](src/clipboard.rs)
+  — FileGroupDescriptorW planning for both paste directions: a remote
+  listing staged as a sanitized relative tree, and copied local paths
+  expanded into the parents-first entry list an offer needs
+- [`take_pending_file_paste`](src/clipboard.rs) — pairs a remote file
+  list with the local paste request it answers
+
 ### `cursor` — transparent pointer shape (opt-in)
 
 - [`TransparentPointer`](src/cursor.rs) — the MS-RDPBCGR
