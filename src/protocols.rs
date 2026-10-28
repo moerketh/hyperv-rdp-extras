@@ -46,10 +46,7 @@ macro_rules! wayland_protocol {
 
 pub mod output_device {
     pub mod v2 {
-        wayland_protocol!(
-            "protocols/kde-output-device-v2.xml",
-            []
-        );
+        wayland_protocol!("protocols/kde-output-device-v2.xml", []);
     }
 }
 

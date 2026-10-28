@@ -78,13 +78,13 @@ impl Default for VirtualOutputConfig {
 /// declaring the create wedged (KWin not answering) and giving up.
 pub const STREAM_CREATE_TIMEOUT: Duration = Duration::from_secs(10);
 
-    /// Settle window before a swapped-out stream's close is sent. The
-    /// close removes the old virtual output; plasmashell binds the
-    /// replacement's wl_registry global asynchronously, and a removal
-    /// processed before that bind sends Qt to its placeholder screen
-    /// (never re-latches; field-observed during resize churn). Mirrors the
-    /// layout guard's engage settle window.
-    pub const SETTLE_CLOSE_MS: Duration = Duration::from_millis(750);
+/// Settle window before a swapped-out stream's close is sent. The
+/// close removes the old virtual output; plasmashell binds the
+/// replacement's wl_registry global asynchronously, and a removal
+/// processed before that bind sends Qt to its placeholder screen
+/// (never re-latches; field-observed during resize churn). Mirrors the
+/// layout guard's engage settle window.
+pub const SETTLE_CLOSE_MS: Duration = Duration::from_millis(750);
 
 /// Deadline for an in-place mode-change transaction (experiment D): TX1
 /// (inject custom mode) + TX2 (set mode) must conclude within this window
@@ -348,24 +348,19 @@ impl VirtualOutputManager {
                 SETTLE_CLOSE_MS.as_millis() as u64 + 2_500,
             ] {
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                let adopted = tokio::task::spawn_blocking(
-                    reattach_plasmashell_containments,
-                )
-                .await
-                .unwrap_or(0);
+                let adopted = tokio::task::spawn_blocking(reattach_plasmashell_containments)
+                    .await
+                    .unwrap_or(0);
                 info!(
                     adopted,
-                    delay_ms,
-                    "[kwin-virtual] proactive containment reattach pass complete"
+                    delay_ms, "[kwin-virtual] proactive containment reattach pass complete"
                 );
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
             let name = norm_kscreen;
-            let norm = tokio::task::spawn_blocking(move || {
-                normalize_virtual_output_origin(&name)
-            })
-            .await
-            .unwrap_or(None);
+            let norm = tokio::task::spawn_blocking(move || normalize_virtual_output_origin(&name))
+                .await
+                .unwrap_or(None);
             if norm != Some((0, 0)) {
                 warn!(
                     "[kwin-virtual] virtual output not verified at (0,0) after create settle ({norm:?}) — continuing"
@@ -384,11 +379,7 @@ impl VirtualOutputManager {
     /// Returns a distinct [`ModeChangeOutcome`]; every outcome except
     /// [`ModeChangeOutcome::Applied`] means the output was untouched and
     /// the caller must fall back to [`Self::recreate_stream`].
-    pub async fn try_change_mode_in_place(
-        &self,
-        width: u16,
-        height: u16,
-    ) -> ModeChangeOutcome {
+    pub async fn try_change_mode_in_place(&self, width: u16, height: u16) -> ModeChangeOutcome {
         let Ok(tx) = self.ensure_wl_thread().await else {
             return ModeChangeOutcome::Failed("zkde-screencast thread unavailable".into());
         };
@@ -450,9 +441,7 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>, config: VirtualOutpu
         },
         output_management::v2::client::{
             kde_mode_list_v2::{Event as ModeListEvent, KdeModeListV2},
-            kde_output_configuration_v2::{
-                Event as ConfigurationEvent, KdeOutputConfigurationV2,
-            },
+            kde_output_configuration_v2::{Event as ConfigurationEvent, KdeOutputConfigurationV2},
             kde_output_management_v2::KdeOutputManagementV2,
         },
     };
@@ -536,10 +525,7 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>, config: VirtualOutpu
         /// capture; field-observed during resize churn). Parking the close
         /// for SETTLE_CLOSE_MS lets clients bind first, exactly like the
         /// layout guard's engage settle.
-        closing: Option<(
-            ZkdeScreencastStreamUnstableV1,
-            std::time::Instant,
-        )>,
+        closing: Option<(ZkdeScreencastStreamUnstableV1, std::time::Instant)>,
         /// Stream request state machine (conclusive-event bookkeeping).
         stream_sm: StreamRequestMachine,
         /// kde_output_management_v2 proxy + bound version (experiment D).
@@ -557,7 +543,7 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>, config: VirtualOutpu
     }
 
     /// Find the tracked device for our virtual output by its kscreen name.
-    fn find_device<'a>(state: &'a mut State) -> Option<&'a mut DeviceTrack> {
+    fn find_device(state: &mut State) -> Option<&mut DeviceTrack> {
         let wanted = state.kscreen_name.clone();
         state.devices.iter_mut().find(|d| d.name == wanted)
     }
@@ -623,7 +609,6 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>, config: VirtualOutpu
         }
     }
 
-
     impl Dispatch<wl_registry::WlRegistry, ()> for State {
         fn event(
             state: &mut Self,
@@ -656,7 +641,8 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>, config: VirtualOutpu
                 // advertises v21; KWin < 6.7 binds below v18 and reports
                 // Unsupported on use (no set_custom_modes there).
                 let bind_version = version.min(22);
-                let mgmt = registry.bind::<KdeOutputManagementV2, _, State>(name, bind_version, qh, ());
+                let mgmt =
+                    registry.bind::<KdeOutputManagementV2, _, State>(name, bind_version, qh, ());
                 state.mgmt = Some((mgmt, bind_version));
                 info!(
                     "[kwin-virtual] bound kde_output_management_v2 (global v{version}, bound v{bind_version})"
@@ -667,8 +653,12 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>, config: VirtualOutpu
                 // plain globals — deliberately NOT handled; the in-place
                 // path reports NotAdvertised and the caller falls back.
                 let bind_version = version.min(25);
-                let devreg =
-                    registry.bind::<KdeOutputDeviceRegistryV2, _, State>(name, bind_version, qh, ());
+                let devreg = registry.bind::<KdeOutputDeviceRegistryV2, _, State>(
+                    name,
+                    bind_version,
+                    qh,
+                    (),
+                );
                 state.device_registry = Some(devreg);
                 info!(
                     "[kwin-virtual] bound kde_output_device_registry_v2 (global v{version}, bound v{bind_version})"
@@ -796,17 +786,14 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>, config: VirtualOutpu
             _: &Connection,
             _: &QueueHandle<Self>,
         ) {
-            match event {
-                DeviceRegistryEvent::Output { output } => {
-                    state.devices.push(DeviceTrack {
-                        device: output,
-                        name: String::new(),
-                        capabilities: 0,
-                        modes: Vec::new(),
-                    });
-                }
-                // `finished` is a destructor; other events are unused.
-                _ => {}
+            // `finished` is a destructor; other events are unused.
+            if let DeviceRegistryEvent::Output { output } = event {
+                state.devices.push(DeviceTrack {
+                    device: output,
+                    name: String::new(),
+                    capabilities: 0,
+                    modes: Vec::new(),
+                });
             }
         }
 
@@ -826,7 +813,10 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>, config: VirtualOutpu
             _: &Connection,
             qh: &QueueHandle<Self>,
         ) {
-            let Some(idx) = state.devices.iter().position(|d| d.device.id() == device.id())
+            let Some(idx) = state
+                .devices
+                .iter()
+                .position(|d| d.device.id() == device.id())
             else {
                 return;
             };
@@ -931,9 +921,7 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>, config: VirtualOutpu
                         if !try_start_tx2(state, qh) {
                             // Mode object not re-announced yet; the
                             // device's done event completes the trigger.
-                            info!(
-                                "[kwin-virtual] TX1 applied; awaiting mode re-announcement"
-                            );
+                            info!("[kwin-virtual] TX1 applied; awaiting mode re-announcement");
                         }
                     } else {
                         // TX2 applied: DONE. The output switched modes in
@@ -1384,11 +1372,10 @@ impl OutputLayoutGuard {
             // snapshotted nothing, Drop restored nothing, and a single
             // headless entry wedged forever (field-observed: every later
             // session streamed a dead shell after its teardown).
-            let adopted = tokio::task::spawn_blocking(move || {
-                list_recoverable_physical_outputs(&exclude1)
-            })
-            .await
-            .unwrap_or_default();
+            let adopted =
+                tokio::task::spawn_blocking(move || list_recoverable_physical_outputs(&exclude1))
+                    .await
+                    .unwrap_or_default();
             if adopted.is_empty() {
                 warn!(
                     "[kwin-virtual] no enabled or recoverable physical outputs — console restore at release will be impossible"
@@ -1495,15 +1482,11 @@ impl OutputLayoutGuard {
         // a failure logs and continues (the fork's blank-capture heal
         // remains as backstop).
         let norm_name = config.kscreen_name.clone();
-        let norm = tokio::task::spawn_blocking(move || {
-            normalize_virtual_output_origin(&norm_name)
-        })
-        .await
-        .unwrap_or(None);
+        let norm = tokio::task::spawn_blocking(move || normalize_virtual_output_origin(&norm_name))
+            .await
+            .unwrap_or(None);
         if norm != Some((0, 0)) {
-            warn!(
-                "[kwin-virtual] virtual output not verified at (0,0) after engage ({norm:?})"
-            );
+            warn!("[kwin-virtual] virtual output not verified at (0,0) after engage ({norm:?})");
         }
         Self {
             disabled: names,
@@ -1736,8 +1719,8 @@ fn parse_physical_outputs(
             // only in the recoverable variant AND only when the connector
             // is still connected (an absent display can't be re-enabled
             // into anything useful).
-            let qualifies = current_enabled
-                || (include_disabled && current_connected && !current_enabled);
+            let qualifies =
+                current_enabled || (include_disabled && current_connected && !current_enabled);
             if let (Some(name), true) = (&current_name, qualifies)
                 && name != exclude_kscreen_name
             {
@@ -1765,9 +1748,9 @@ fn parse_physical_outputs(
         }
     }
     // Flush the final block (no trailing "Output:" line).
-    let qualifies =
-        current_enabled || (include_disabled && current_connected && !current_enabled);
-    if let (Some(name), true) = (&current_name, qualifies) && name != exclude_kscreen_name
+    let qualifies = current_enabled || (include_disabled && current_connected && !current_enabled);
+    if let (Some(name), true) = (&current_name, qualifies)
+        && name != exclude_kscreen_name
     {
         result.push(name.clone());
     }
@@ -2052,9 +2035,20 @@ fn restart_plasmashell() -> bool {
     };
     let plasmashell_alive = || run("pgrep", &["-x", "plasmashell"]);
 
-    if run("systemctl", &["--user", "is-active", "--quiet", "plasma-plasmashell.service"]) {
+    if run(
+        "systemctl",
+        &[
+            "--user",
+            "is-active",
+            "--quiet",
+            "plasma-plasmashell.service",
+        ],
+    ) {
         info!("[kwin-virtual] restarting plasmashell via systemd unit");
-        if run("systemctl", &["--user", "restart", "plasma-plasmashell.service"]) {
+        if run(
+            "systemctl",
+            &["--user", "restart", "plasma-plasmashell.service"],
+        ) {
             std::thread::sleep(Duration::from_millis(1500));
             return plasmashell_alive();
         }
@@ -2244,11 +2238,9 @@ fn reattach_plasmashell_containments() -> u32 {
 /// could not fix.
 pub async fn heal_output_layout(kscreen_name: &str, escalate_restart: bool) -> bool {
     let name = kscreen_name.to_string();
-    let normalized = tokio::task::spawn_blocking(move || {
-        normalize_virtual_output_origin(&name)
-    })
-    .await
-    .unwrap_or(None);
+    let normalized = tokio::task::spawn_blocking(move || normalize_virtual_output_origin(&name))
+        .await
+        .unwrap_or(None);
     let normalized = match normalized {
         Some(pos) => pos,
         None => {
@@ -2346,7 +2338,7 @@ Output: 2 Virtual-1 892482c9-0b93-4a86-b5ea-d1ddce3cb43b
                 height: 1080,
             },
         ];
-        assert_eq!(parse_output_geometries(&text_67), expected);
+        assert_eq!(parse_output_geometries(text_67), expected);
         assert_eq!(parse_output_geometries(&text_63), expected);
     }
 
@@ -2569,14 +2561,20 @@ Output: 2 Virtual-lamco
         for _ in 0..10 {
             assert!(take_due_settle_close(&mut closing).is_none());
             // The item must still be parked, not dropped.
-            assert!(closing.is_some(), "parked close was dropped before its deadline");
+            assert!(
+                closing.is_some(),
+                "parked close was dropped before its deadline"
+            );
             assert_eq!(closing.as_ref().map(|(s, _)| *s), Some("old-stream"));
         }
     }
 
     #[test]
     fn settle_close_returns_once_when_due() {
-        let mut closing = Some(("old-stream", std::time::Instant::now() - Duration::from_millis(1)));
+        let mut closing = Some((
+            "old-stream",
+            std::time::Instant::now() - Duration::from_millis(1),
+        ));
         assert_eq!(take_due_settle_close(&mut closing), Some("old-stream"));
         // Consumed exactly once; the slot is empty afterwards.
         assert!(closing.is_none());
