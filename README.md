@@ -47,6 +47,10 @@ See [PROVENANCE.md](PROVENANCE.md) for the per-module audit trail.
   pointer ownership on clients that ignore `HidePointer` (e.g. Hyper-V
   vmconnect); plus [`ResendCounter`](src/cursor.rs) for the
   immediate-first-send / periodic re-send cadence.
+- [`PointerEchoFilter`](src/cursor.rs) — decides which server-observed
+  pointer positions to send as Pointer Position updates: application
+  warps only, never late echoes of the client's own mouse input (which
+  would drag the client's local pointer back while it moves).
 
 ### `session` — KWin virtual output (opt-in)
 

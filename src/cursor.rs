@@ -147,6 +147,83 @@ impl ResendCounter {
     }
 }
 
+/// Decides when a server-observed pointer position may be sent to the
+/// client as a Pointer Position update (MS-RDPBCGR §2.2.9.1.1.4.2).
+///
+/// A client handles that PDU by **moving its local pointer** there. When
+/// the position comes from compositor cursor metadata, most positions are
+/// echoes of the client's own mouse input, a few frames late; forwarding
+/// them drags the local pointer back to where it was 50-100 ms earlier
+/// while the user moves it (measured on Hyper-V vmconnect against GNOME's
+/// metadata cursor: a lagging trail of pointers). Only a position the
+/// guest produced on its own — an application warp — belongs on the wire.
+///
+/// The filter suppresses a position while client input is recent (within
+/// `quiet`) or when it lies within `tolerance` pixels (per axis) of where
+/// the client last put — or was last sent — the pointer, so coordinate
+/// rounding between the client and stream spaces never reads as a warp.
+#[derive(Debug, Clone)]
+pub struct PointerEchoFilter {
+    quiet: std::time::Duration,
+    tolerance: u16,
+    /// Where the client's local pointer is believed to be, and when the
+    /// client last moved it (`None` for a position this filter sent).
+    client_pointer: Option<((u16, u16), Option<std::time::Instant>)>,
+}
+
+impl Default for PointerEchoFilter {
+    fn default() -> Self {
+        Self::new(Self::DEFAULT_QUIET, Self::DEFAULT_TOLERANCE)
+    }
+}
+
+impl PointerEchoFilter {
+    /// Long enough for the compositor's trailing cursor samples after the
+    /// last client move to arrive (a few frames plus pipeline latency).
+    pub const DEFAULT_QUIET: std::time::Duration = std::time::Duration::from_millis(500);
+    /// Per-axis slack for client/stream coordinate rounding (e.g. a client
+    /// at 1920x1200 against a 1920x1080 capture).
+    pub const DEFAULT_TOLERANCE: u16 = 4;
+
+    /// A filter with the given quiet period and per-axis tolerance.
+    #[must_use]
+    pub fn new(quiet: std::time::Duration, tolerance: u16) -> Self {
+        Self {
+            quiet,
+            tolerance,
+            client_pointer: None,
+        }
+    }
+
+    /// Record an absolute pointer move the client sent.
+    pub fn note_client_move(&mut self, position: (u16, u16), now: std::time::Instant) {
+        self.client_pointer = Some((position, Some(now)));
+    }
+
+    /// Whether `position` (server-observed, client coordinates) should be
+    /// sent. Returning `true` records it as the client's new pointer
+    /// position, so the same position is not sent twice.
+    pub fn should_send(&mut self, position: (u16, u16), now: std::time::Instant) -> bool {
+        if let Some((known, moved_at)) = self.client_pointer {
+            if moved_at.is_some_and(|t| now.saturating_duration_since(t) < self.quiet) {
+                return false;
+            }
+            if known.0.abs_diff(position.0) <= self.tolerance
+                && known.1.abs_diff(position.1) <= self.tolerance
+            {
+                return false;
+            }
+        }
+        self.client_pointer = Some((position, None));
+        true
+    }
+
+    /// Forget the client pointer state (a new client connected).
+    pub fn reset(&mut self) {
+        self.client_pointer = None;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,5 +292,53 @@ mod tests {
     #[should_panic(expected = "interval must be > 0")]
     fn zero_interval_is_rejected() {
         let _ = ResendCounter::new(0);
+    }
+
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn echo_filter_suppresses_positions_while_the_client_moves() {
+        let mut f = PointerEchoFilter::default();
+        let t0 = Instant::now();
+        f.note_client_move((500, 500), t0);
+        // Trailing compositor samples of the client's own motion.
+        assert!(!f.should_send((480, 490), t0 + Duration::from_millis(40)));
+        assert!(!f.should_send((300, 300), t0 + Duration::from_millis(499)));
+    }
+
+    #[test]
+    fn echo_filter_suppresses_the_settled_echo_within_tolerance() {
+        let mut f = PointerEchoFilter::default();
+        let t0 = Instant::now();
+        f.note_client_move((500, 500), t0);
+        let later = t0 + Duration::from_secs(1);
+        assert!(!f.should_send((503, 497), later), "rounding is not a warp");
+    }
+
+    #[test]
+    fn echo_filter_sends_an_application_warp_once() {
+        let mut f = PointerEchoFilter::default();
+        let t0 = Instant::now();
+        f.note_client_move((500, 500), t0);
+        let later = t0 + Duration::from_secs(1);
+        assert!(f.should_send((100, 900), later), "guest-side warp");
+        assert!(
+            !f.should_send((100, 900), later + Duration::from_millis(16)),
+            "not re-sent"
+        );
+        assert!(
+            f.should_send((800, 100), later + Duration::from_millis(32)),
+            "next warp"
+        );
+    }
+
+    #[test]
+    fn echo_filter_sends_the_first_position_and_after_reset() {
+        let mut f = PointerEchoFilter::default();
+        let t0 = Instant::now();
+        assert!(f.should_send((10, 10), t0), "initial sync");
+        assert!(!f.should_send((10, 10), t0));
+        f.reset();
+        assert!(f.should_send((10, 10), t0), "new client gets a sync");
     }
 }
