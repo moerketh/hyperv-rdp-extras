@@ -1123,22 +1123,18 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>, config: VirtualOutpu
                         state.retiring = Some(prev);
                     }
                     state.stream_sm.reset();
-                    // Pointer mode argument: measured on KWin
-                    // 6.3.6 — this argument does NOT control
-                    // whether KWin paints the cursor into the virtual
-                    // output's frames. Requesting Metadata still yielded a
-                    // composited cursor (two pointers with the client's
-                    // arrow); requesting Hidden did too. It also does not
-                    // yield SPA_META_Cursor: with Metadata requested, cursor
-                    // meta was absent on every frame of a whole live session
-                    // while the consumer provably requested SPA_META_Cursor
-                    // (the capture crate requests it unconditionally).
-                    // Embedded (=2) is kept as the declared intent — it
-                    // matches the observed behaviour (composited cursor,
-                    // context-aware shapes) — but the value passed here is
-                    // not the lever it appears to be. The client-side arrow
-                    // is suppressed by a transparent pointer shape at the
-                    // RDP layer instead.
+                    // Pointer mode: Embedded. On KWin < 6.5 an output
+                    // screencast copies the output texture, which already
+                    // has the virtual output's software cursor composited
+                    // in, so the requested mode cannot remove it (measured on
+                    // 6.3.6: Metadata and Hidden both still showed it). KWin
+                    // 6.5 re-renders the scene for screencasts and honours
+                    // Metadata (kwin 68c41eed7d, 85c9a58e15), but its cursor
+                    // metadata labels every shape id 1 and sends each bitmap
+                    // once, so client-side shapes go stale; Embedded keeps
+                    // the compositor's own shapes on every version. The
+                    // client arrow is hidden by a transparent pointer shape
+                    // at the RDP layer.
                     let stream = screencast.stream_virtual_output(
                         config.name.clone(),
                         width,
